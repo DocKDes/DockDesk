@@ -6,6 +6,7 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -16,4 +17,5 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
       - run: docker version && docker compose version
+      - run: google-chrome --version || echo 'no google-chrome on this runner'
       - run: npm test

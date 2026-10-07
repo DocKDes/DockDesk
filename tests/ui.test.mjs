@@ -4,9 +4,12 @@ import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
 import { join } from 'node:path'
 import { startServer, janitor, docker, dockerTry, dockerAvailable, waitFor, PREFIX } from './helpers.mjs'
-import { openPage, uiSkipReason } from './cdp.mjs'
+import { openPage, uiSkipReason, probeBrowser } from './cdp.mjs'
 
-const skip = !dockerAvailable() ? 'Docker is not reachable' : uiSkipReason() || false
+// A browser that can't start is an environment problem: locally, skip with the reason shown. In CI (CI=true) it must fail loudly instead.
+const base = !dockerAvailable() ? 'Docker is not reachable' : uiSkipReason() || false
+const probe = base || process.env.CI ? null : await probeBrowser()
+const skip = base || probe || false
 
 describe('DockDesk UI in a real browser', { skip }, () => {
   let J, srv, page, IMG, main, work

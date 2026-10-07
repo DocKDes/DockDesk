@@ -22,6 +22,19 @@ Tests that can't run here are **skipped with a reason**, never failed: no Docker
 | `ui.test.mjs` | Every page renders, sidebar order, Overview, search, all container drawer tabs, log viewer (colours, search, filter, download), file browser (including upload), command palette, compose editor validation, run dialog, layers view, Activity, Labs, Settings; fails on any uncaught JavaScript error |
 | `registry.test.mjs` | Opt-in. Real sign-in, push, catalog check and sign-out; proves the password is never returned or written in clear |
 
+## Browser tests and environment variables
+
+| Variable | Effect |
+|---|---|
+| `DD_TEST_BROWSER=/path/to/chrome` | Use this browser instead of searching for `chromium`, `google-chrome`… |
+| `DD_TEST_UI=0` | Skip the browser tests |
+| `DD_TEST_IMAGE=some/image` | Image used for test containers (needs `sh`, `sleep`, `ls`) |
+| `DD_TEST_NETWORK=1` | Also run tests that need the internet |
+| `DD_TEST_REGISTRY=1` | Also run the registry test |
+| `DD_TEST_FILE_TIMEOUT_MS` | Time limit per test file (default 10 minutes); a stuck file is killed together with any browser or server it started |
+
+If the browser can't start, the UI tests **skip with the reason** on a normal machine and **fail** when `CI=true`. A common cause is a snap-packaged Chromium (Ubuntu's default `chromium-browser`): its sandbox can't use the temporary profile folder, so install Google Chrome or Debian's Chromium, or point `DD_TEST_BROWSER` at one.
+
 ## Safety
 
 - Everything the tests create is named `ddtest-<random>…` and removed afterwards, including anonymous volumes created during the run. Your own containers, images, volumes and networks are never touched.
