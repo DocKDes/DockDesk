@@ -53,7 +53,7 @@ export function janitor() {
         if (mine) dockerTry('volume', 'rm', v)
       }
       if (pulled) dockerTry('rmi', pulled)
-      for (const d of dirs) rmSync(d, { recursive: true, force: true })
+      for (const d of dirs) { try { rmSync(d, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }) } catch {} }
     }
   }
 }

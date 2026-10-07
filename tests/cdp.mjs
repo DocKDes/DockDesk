@@ -41,18 +41,32 @@ export async function openPage(url, { width = 1360, height = 860, scheme = 'ligh
   const bin = findBrowser()
   const dir = mkdtempSync(join(tmpdir(), 'ddtest-chrome-'))
   let proc = null, stderr = ''
-  const killBrowser = () => { try { proc?.kill('SIGKILL') } catch {} }
+  // The browser runs in its own process group so the WHOLE tree (helpers, GPU and renderer processes) can be killed. Killing only the main
+  // process leaves helpers alive for a moment, and they keep writing into the profile folder, which races with deleting it.
+  const killBrowser = () => {
+    if (!proc?.pid) return
+    try { process.kill(-proc.pid, 'SIGKILL') } catch { try { proc.kill('SIGKILL') } catch {} }
+  }
+  const gone = async () => { for (let i = 0; i < 60; i++) { try { process.kill(-proc.pid, 0) } catch { return } await sleep(50) } }
   process.once('exit', killBrowser) // never leave a browser behind, whatever happens
-  const abandon = () => { killBrowser(); rmSync(dir, { recursive: true, force: true }) }
+  // If the runner stops this test process (timeout, Ctrl+C), stop the browser too: it is in its own process group, so it would not be reached otherwise.
+  const onSignal = () => { killBrowser(); process.exit(143) }
+  process.once('SIGTERM', onSignal); process.once('SIGINT', onSignal)
+  // Cleanup is best effort: a temp folder that can't be deleted must never fail a test run.
+  const abandon = async () => {
+    process.removeListener('SIGTERM', onSignal); process.removeListener('SIGINT', onSignal)
+    killBrowser(); if (proc?.pid) await gone()
+    try { rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }) } catch {}
+  }
   try {
     // Newer Chrome wants --headless=new; older builds only know plain --headless. Try both, each with its own short wait.
     let port = null
     for (const headless of ['--headless=new', '--headless']) {
       stderr = ''
-      proc = spawn(bin, [headless, '--no-sandbox', '--disable-gpu', '--no-first-run', `--user-data-dir=${dir}`, '--remote-debugging-port=0', `--window-size=${width},${height}`, 'about:blank'], { stdio: ['ignore', 'ignore', 'pipe'] })
+      proc = spawn(bin, [headless, '--no-sandbox', '--disable-gpu', '--no-first-run', `--user-data-dir=${dir}`, '--remote-debugging-port=0', `--window-size=${width},${height}`, 'about:blank'], { stdio: ['ignore', 'ignore', 'pipe'], detached: true })
       proc.unref(); proc.stderr.on('data', (c) => (stderr = (stderr + c).slice(-1500))); proc.stderr.unref?.()
       try { port = await waitFor(() => { const t = readFileSync(join(dir, 'DevToolsActivePort'), 'utf8').split('\n')[0]; return t && Number(t) }, { timeout: 10000, what: 'the browser to report its debugging port' }); break }
-      catch { killBrowser(); rmSync(join(dir, 'DevToolsActivePort'), { force: true }); await sleep(300) }
+      catch { killBrowser(); await gone(); try { rmSync(join(dir, 'DevToolsActivePort'), { force: true }) } catch {} }
     }
     if (!port) throw new Error(`The browser (${bin}) did not start. ${snapHint(bin)}${stderr.trim() ? `\n--- browser output (last lines):\n${stderr.trim()}` : ''}`)
 
@@ -86,11 +100,11 @@ export async function openPage(url, { width = 1360, height = 860, scheme = 'ligh
       waitFor: (expr, opts) => waitFor(() => page.eval(expr), { what: expr.slice(0, 70), ...opts }),
       async goto(u) { await send('Page.navigate', { url: u }) },
       async screenshot(file) { writeFileSync(file, Buffer.from((await send('Page.captureScreenshot')).result.data, 'base64')) },
-      async close() { try { ws.close() } catch {} abandon(); await sleep(100) }
+      async close() { try { ws.close() } catch {} await abandon() }
     }
     await page.goto(url)
     return page
-  } catch (e) { abandon(); throw e } // a failed start must not leave a browser running: it would keep the whole test process alive
+  } catch (e) { await abandon(); throw e } // a failed start must not leave a browser running: it would keep the whole test process alive
 }
 
 // Can a browser be started here at all? Returns null when yes, or a human-readable reason when not.
