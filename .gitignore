@@ -1,0 +1,19 @@
+# build output and packaging leftovers
+dist/
+*.tgz
+
+# dependencies (there are none today, but npm would create this)
+node_modules/
+
+# local secrets and personal tool folders: never commit these
+.env
+.env.*
+.claude/
+.vscode/
+.idea/
+
+# backups and noise
+*.bak
+*.log
+.DS_Store
+coverage/

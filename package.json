@@ -1,0 +1,51 @@
+{
+  "name": "dockdesk",
+  "version": "0.1.0",
+  "description": "A lightweight Docker Desktop alternative for Linux",
+  "license": "MIT",
+  "bin": {
+    "dockdesk": "bin/dockdesk"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "deb": "sh packaging/build-deb.sh",
+    "test": "node tests/run.mjs",
+    "test:security": "node tests/run.mjs security",
+    "test:api": "node tests/run.mjs api",
+    "test:ui": "node tests/run.mjs ui",
+    "test:registry": "DD_TEST_REGISTRY=1 node tests/run.mjs registry",
+    "release": "sh packaging/release.sh",
+    "test:package": "node tests/run.mjs package"
+  },
+  "author": "Panem Yaswanth Reddy <panemyaswanthreddy@gmail.com>",
+  "keywords": [
+    "docker",
+    "docker-desktop",
+    "gui",
+    "containers",
+    "compose",
+    "linux",
+    "kali"
+  ],
+  "engines": {
+    "node": ">=18.17"
+  },
+  "os": [
+    "linux"
+  ],
+  "files": [
+    "server.js",
+    "pty-shell.py",
+    "dockdesk-polkit.rules",
+    "public",
+    "bin",
+    "install.sh",
+    "uninstall.sh",
+    "packaging",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "CHANGELOG.md",
+    "SECURITY.md"
+  ]
+}

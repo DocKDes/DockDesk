@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=DockDesk
+Comment=Manage Docker containers, images, volumes and networks
+Exec=dockdesk
+Icon=dockdesk
+Categories=Development;System;
+StartupWMClass=DockDesk
+Terminal=false

@@ -1,0 +1,12 @@
+// DockDesk (optional): lets members of the "docker" group start/stop/restart the Docker engine
+// without a password prompt. Scoped to docker.service and docker.socket only.
+// Install:  sudo cp dockdesk-polkit.rules /etc/polkit-1/rules.d/50-dockdesk.rules
+// Remove:   sudo rm /etc/polkit-1/rules.d/50-dockdesk.rules
+polkit.addRule(function (action, subject) {
+  if (action.id == "org.freedesktop.systemd1.manage-units" && subject.isInGroup("docker")) {
+    var unit = action.lookup("unit");
+    if (unit == "docker.service" || unit == "docker.socket") {
+      return polkit.Result.YES;
+    }
+  }
+});

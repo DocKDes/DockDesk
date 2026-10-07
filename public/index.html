@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DockDesk</title>
+<link rel="icon" href="icon.png">
+<script>try{document.documentElement.dataset.theme=localStorage.getItem('theme')||(matchMedia('(prefers-color-scheme: light)').matches?'light':'dark')}catch{document.documentElement.dataset.theme='dark'}</script>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+  <aside id="nav"></aside>
+  <section id="center">
+    <main><div id="banner" hidden></div><div id="page"></div></main>
+    <div id="dock" hidden>
+      <div id="grip"></div>
+      <div class="dock-bar"><div class="dock-tabs" id="dock-tabs"></div><div id="dock-ctl"></div></div>
+      <div id="dock-body"></div>
+    </div>
+  </section>
+  <footer id="status"></footer>
+</div>
+<div id="menu" hidden></div>
+<div id="toast" hidden></div>
+<script type="module" src="app.js"></script>
+</body>
+</html>
