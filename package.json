@@ -1,23 +1,17 @@
 {
   "name": "dockdesk",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A lightweight Docker Desktop alternative for Linux",
-  "license": "MIT",
-  "bin": {
-    "dockdesk": "bin/dockdesk"
-  },
-  "scripts": {
-    "start": "node server.js",
-    "deb": "sh packaging/build-deb.sh",
-    "test": "node tests/run.mjs",
-    "test:security": "node tests/run.mjs security",
-    "test:api": "node tests/run.mjs api",
-    "test:ui": "node tests/run.mjs ui",
-    "test:registry": "DD_TEST_REGISTRY=1 node tests/run.mjs registry",
-    "release": "sh packaging/release.sh",
-    "test:package": "node tests/run.mjs package"
-  },
   "author": "Panem Yaswanth Reddy <panemyaswanthreddy@gmail.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DocKDes/DockDesk.git"
+  },
+  "homepage": "https://github.com/DocKDes/DockDesk#readme",
+  "bugs": {
+    "url": "https://github.com/DocKDes/DockDesk/issues"
+  },
   "keywords": [
     "docker",
     "docker-desktop",
@@ -33,6 +27,9 @@
   "os": [
     "linux"
   ],
+  "bin": {
+    "dockdesk": "bin/dockdesk"
+  },
   "files": [
     "server.js",
     "pty-shell.py",
@@ -47,5 +44,19 @@
     "THIRD_PARTY_NOTICES.md",
     "CHANGELOG.md",
     "SECURITY.md"
-  ]
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "deb": "sh packaging/build-deb.sh",
+    "test": "node tests/run.mjs",
+    "test:security": "node tests/run.mjs security",
+    "test:api": "node tests/run.mjs api",
+    "test:ui": "node tests/run.mjs ui",
+    "test:registry": "DD_TEST_REGISTRY=1 node tests/run.mjs registry",
+    "release": "sh packaging/release.sh",
+    "test:package": "node tests/run.mjs package"
+  }
 }

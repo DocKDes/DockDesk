@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.1 (2026-10-07)
+
+- Published on npm: `npx dockdesk` to try it, `npm install -g dockdesk` to install (Linux, Node 18.17+). The package has no dependencies and no install scripts.
+- Package metadata now links to the repository, homepage and issue tracker.
+- The release workflow publishes to npm with provenance when an `NPM_TOKEN` secret is set, and is safe to re-run.
+
 ## 0.1.0 (2026-10-07)
 
 First release.

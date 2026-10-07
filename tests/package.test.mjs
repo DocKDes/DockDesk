@@ -89,3 +89,57 @@ describe('release artifacts', { skip: haveDpkg ? false : 'dpkg-deb is not instal
     for (const f of ['.local/bin/dockdesk', '.local/share/dockdesk', '.local/share/applications/dockdesk.desktop']) assert.ok(!existsSync(join(home, f)), `uninstall.sh left ${f}`)
   })
 })
+
+const haveNpm = spawnSync('npm', ['--version'], { stdio: 'ignore' }).status === 0
+
+describe('npm package', { skip: haveNpm ? false : 'npm is not installed' }, () => {
+  let J, tgz, files
+  before(() => {
+    J = janitor()
+    const out = J.tmp('npm')
+    // `npm pack` builds exactly what `npm publish` would upload (nothing is uploaded)
+    const name = sh('npm', ['pack', '--silent', '--pack-destination', out], { cwd: ROOT }).trim().split('\n').pop()
+    tgz = join(out, name)
+    files = sh('tar', ['tzf', tgz]).split('\n').filter(Boolean).map((f) => f.replace(/^package\//, ''))
+  })
+  after(() => J.cleanup())
+
+  it('links to the repository, homepage and issue tracker', () => {
+    assert.equal(pkg.repository.url, 'git+https://github.com/DocKDes/DockDesk.git')
+    assert.equal(pkg.homepage, 'https://github.com/DocKDes/DockDesk#readme'); assert.equal(pkg.bugs.url, 'https://github.com/DocKDes/DockDesk/issues')
+    assert.equal(pkg.publishConfig.access, 'public')
+  })
+  it('has no dependencies and runs no scripts at install time (supply-chain safety)', () => {
+    assert.ok(!pkg.dependencies || Object.keys(pkg.dependencies).length === 0, 'no runtime dependencies')
+    for (const hook of ['preinstall', 'install', 'postinstall', 'prepare', 'prepublish', 'preuninstall', 'postuninstall']) assert.ok(!pkg.scripts?.[hook], `no ${hook} script`)
+  })
+  it('publishes the app and its licences, and nothing else', () => {
+    for (const f of ['server.js', 'pty-shell.py', 'bin/dockdesk', 'public/index.html', 'public/app.js', 'public/vendor/xterm.js', 'LICENSE', 'THIRD_PARTY_NOTICES.md', 'README.md', 'package.json']) assert.ok(files.includes(f), `missing ${f}`)
+    assert.ok(!files.some((f) => /^(tests|\.github|dist|node_modules|\.git)\//.test(f)), 'no tests, CI files, build output or git data')
+    assert.ok(!files.some((f) => /\.(env|pem|key)$|\.dockdesk\.bak$/.test(f)), 'no secrets or backups')
+    assert.ok(statSync(tgz).size < 300 * 1024, 'the tarball stays small')
+  })
+  it('installs from the tarball into a clean prefix, runs, and uninstalls', async () => {
+    const prefix = join(J.tmp('prefix'), 'p'), home = J.tmp('home')
+    const env = { ...process.env, HOME: home, npm_config_cache: join(home, '.npm'), XDG_DATA_HOME: join(home, 'data') }
+    sh('npm', ['install', '-g', '--prefix', prefix, '--no-audit', '--no-fund', '--offline', tgz], { env })
+    const bin = join(prefix, 'bin/dockdesk'); assert.ok(existsSync(bin), 'the dockdesk command is installed')
+    assert.ok(statSync(bin).mode & 0o111, 'and executable')
+    const { spawn } = await import('node:child_process')
+    const p = spawn(bin, [], { env: { ...env, DOCKDESK_NO_OPEN: '1' }, stdio: ['ignore', 'pipe', 'pipe'] })
+    try {
+      let out = ''; p.stdout.on('data', (c) => (out += c))
+      const m = await waitFor(() => /(http:\/\/127\.0\.0\.1:\d+)\//.exec(out), { what: 'the npm-installed command to start' })
+      assert.equal((await fetch(m[1] + '/')).status, 200)
+      assert.equal((await fetch(m[1] + '/api/ping', { method: 'POST' })).status, 401, 'and it still demands the token')
+    } finally { p.kill('SIGTERM') }
+    sh('npm', ['uninstall', '-g', '--prefix', prefix, '--no-audit', '--no-fund', 'dockdesk'], { env })
+    assert.ok(!existsSync(bin), 'uninstall removes the command')
+  })
+  it('release workflow publishes with provenance, only with a token, and can be re-run safely', () => {
+    const r = read('.github/workflows/release.yml')
+    assert.match(r, /npm publish --provenance --access public/); assert.match(r, /id-token: write/); assert.match(r, /secrets\.NPM_TOKEN/)
+    assert.match(r, /registry-url: https:\/\/registry\.npmjs\.org/); assert.match(r, /npm view "dockdesk@\$VER"/, 'skips versions already on npm')
+    assert.match(r, /gh release view/, 'the GitHub release step is idempotent'); assert.match(r, /NPM_TOKEN: \$\{\{ secrets\.NPM_TOKEN \}\}/)
+  })
+})

@@ -3,21 +3,44 @@ on:
   push:
     tags: ['v*']
 permissions:
-  contents: write
+  contents: write      # create the GitHub release
+  id-token: write      # npm provenance (links the npm package to this exact build)
 jobs:
   release:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+          registry-url: https://registry.npmjs.org
       - name: Tag must match package.json
         run: test "v$(node -p "require('./package.json').version")" = "$GITHUB_REF_NAME"
       - run: npm test
       - run: sh packaging/release.sh
-      - name: Publish release
+      - name: GitHub release (safe to re-run)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release create "$GITHUB_REF_NAME" dist/release/* --title "DockDesk ${GITHUB_REF_NAME#v}" --generate-notes
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/release/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/release/* --title "DockDesk ${GITHUB_REF_NAME#v}" --generate-notes
+          fi
+      - name: Publish to npm (safe to re-run)
+        if: env.NPM_TOKEN != ''
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          VER=$(node -p "require('./package.json').version")
+          if npm view "dockdesk@$VER" version >/dev/null 2>&1; then
+            echo "dockdesk@$VER is already on npm: nothing to do"
+          else
+            npm publish --provenance --access public
+          fi
+      - name: npm publish skipped
+        if: env.NPM_TOKEN == ''
+        run: echo "::notice::The NPM_TOKEN secret is not set, so nothing was published to npm. The GitHub release was still created."

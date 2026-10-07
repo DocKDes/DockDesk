@@ -35,6 +35,15 @@ Get the latest files from the project's **Releases** page (each release has a `.
 sudo apt install ./dockdesk_<version>_all.deb
 ```
 
+**npm** (any Linux with Node 18.17+ and Chromium or Chrome)
+
+```sh
+npx dockdesk                     # try it without installing
+npm install -g dockdesk          # install the `dockdesk` command
+```
+
+The npm package has no dependencies and runs no install scripts; it is the same code as the release files.
+
 **Any Linux, no root**
 
 ```sh
