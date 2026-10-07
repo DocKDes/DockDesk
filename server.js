@@ -103,6 +103,7 @@ function composeRun(args, stdin, cwd, ms = 30000) {
     proc.stdout.on('data', (c) => (out += c)); proc.stderr.on('data', (c) => (err += c))
     proc.on('error', (e) => { clearTimeout(timer); resolve({ code: 1, out, err: e.message }) })
     proc.on('close', (code) => { clearTimeout(timer); resolve({ code, out, err }) })
+    proc.stdin.on('error', () => {}) // the command can exit before reading its input (e.g. no compose plugin): that is not a server error
     proc.stdin.end(stdin || '')
   })
 }
@@ -331,6 +332,7 @@ const handlers = {
     proc.stdout.on('data', (c) => (out += c)); proc.stderr.on('data', (c) => (out += c))
     proc.on('error', reject)
     proc.on('close', (code) => code === 0 ? resolve('ok') : reject(new Error(out.replace(/^.*WARNING!.*$/gm, '').trim().split('\n').filter(Boolean).pop() || 'Login failed')))
+    proc.stdin.on('error', () => {}) // docker may exit early (bad registry address): ignore the broken pipe, the exit code reports the failure
     proc.stdin.end(password + '\n')
   }),
   'registry.logout': (server) => {
@@ -692,6 +694,7 @@ async function stream(kind, q, req, res) {
       const proc = spawn('python3', [path.join(__dirname, 'pty-shell.py')], { stdio: ['pipe', 'pipe', 'inherit'], cwd: os.homedir() })
       const dec = new StringDecoder('utf8')
       proc.on('error', (e) => send('error', e.message))
+      proc.stdin.on('error', () => {}) // the shell may already have exited when a late keystroke arrives
       proc.stdout.on('data', (c) => send('data', dec.write(c)))
       proc.on('close', () => { send('end'); execSessions.delete(q.sid) })
       execSessions.set(q.sid, { write: (d) => proc.stdin.write(d), resize: (cols, rows) => proc.stdin.write(`\x1b[8;${rows};${cols}t`) })

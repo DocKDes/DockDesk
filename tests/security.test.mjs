@@ -195,7 +195,8 @@ describe('a missing Compose plugin is explained, not shown as a raw error', () =
     J = janitor()
     // a docker that lacks the compose plugin: `docker compose …` fails exactly like on Debian 12; everything else is passed through
     const real = (() => { try { return execFileSync('which', ['docker'], { encoding: 'utf8' }).trim() } catch { return '/bin/false' } })()
-    const fake = shim(J.tmp('nocompose'), 'docker', { body: `case "$1" in compose) echo "docker: 'compose' is not a docker command." >&2; exit 1;; esac\nexec ${real} "$@"` })
+    // `login` also fails instantly, without reading the password we pipe to it
+    const fake = shim(J.tmp('nocompose'), 'docker', { body: `case "$1" in compose) echo "docker: 'compose' is not a docker command." >&2; exit 1;; login) echo "Error: unreachable registry" >&2; exit 1;; esac\nexec ${real} "$@"` })
     srv = await startServer({ pathPrefix: fake.bin, env: { XDG_DATA_HOME: J.tmp('xdg') } })
   })
   after(() => { srv?.stop(); J.cleanup() })
@@ -203,5 +204,18 @@ describe('a missing Compose plugin is explained, not shown as a raw error', () =
   it('tells the user how to install it when validating or running a compose file', async () => {
     await assert.rejects(srv.call('compose.validate', 'services:\n  a:\n    image: x\n'), /Docker Compose v2 is not installed.*docker-compose/s)
     await assert.rejects(srv.call('compose.action', 'proj', '', '', 'up'), /Docker Compose v2 is not installed/)
+  })
+  // Regression: a command that exits before reading its stdin used to raise an unhandled EPIPE and kill the whole server
+  // (found by CI on Node 18). Hammer both stdin-fed commands and prove the server survives and keeps answering.
+  const alive = async () => { assert.equal(srv.proc.exitCode, null, 'the server process must still be running'); assert.equal((await srv.raw('/')).status, 200) }
+  it('survives compose commands that exit before reading their input', async () => {
+    const results = await Promise.allSettled(Array.from({ length: 40 }, () => srv.call('compose.validate', 'services:\n  a:\n    image: x\n'.repeat(500))))
+    assert.ok(results.every((r) => r.status === 'rejected' && /Docker Compose v2 is not installed/.test(r.reason.message)), results.map((r) => r.reason?.message).find((m) => !/Docker Compose v2/.test(m || '')) || 'every call should get the friendly message')
+    await alive()
+  })
+  it('survives registry logins that exit before reading the password', async () => {
+    const results = await Promise.allSettled(Array.from({ length: 40 }, () => srv.call('registry.login', '', 'someone', 'x'.repeat(3000))))
+    assert.ok(results.every((r) => r.status === 'rejected' && /unreachable registry|Login failed/.test(r.reason.message)), results.map((r) => r.reason?.message).find((m) => !/unreachable|Login failed/.test(m || '')) || 'every call should fail with the command\'s message')
+    await alive()
   })
 })
