@@ -59,6 +59,10 @@ describe('release artifacts', { skip: haveDpkg ? false : 'dpkg-deb is not instal
     assert.match(info, new RegExp(`Version: ${pkg.version.replace(/\./g, '\\.')}`)); assert.match(info, /Maintainer: Panem Yaswanth Reddy <panemyaswanthreddy@gmail\.com>/)
     assert.match(info, /Depends: nodejs \(>= 18\.17\)/); assert.match(info, /Recommends: docker\.io \| docker-ce/); assert.match(info, /docker-compose \(>= 2\)/, 'Kali/Debian 13 name Compose v2 "docker-compose"; the version bound keeps Debian 12\'s old v1 out'); assert.match(info, /does\s+not bundle one/)
   })
+  it('is compressed with xz, which every dpkg understands (newer build hosts default to zstd, which older Debian and Ubuntu cannot unpack)', { skip: spawnSync('which', ['ar'], { stdio: 'ignore' }).status === 0 ? false : 'ar is not installed' }, () => {
+    const members = sh('ar', ['t', deb]).split('\n').filter(Boolean)
+    assert.deepEqual(members.filter((m) => /^(control|data)\.tar/.test(m)).sort(), ['control.tar.xz', 'data.tar.xz'])
+  })
   it('installs licence, notices, security policy, changelog and a Debian copyright file', () => {
     const files = sh('dpkg-deb', ['-c', deb])
     for (const f of ['usr/share/doc/dockdesk/LICENSE', 'usr/share/doc/dockdesk/THIRD_PARTY_NOTICES.md', 'usr/share/doc/dockdesk/copyright', 'usr/share/doc/dockdesk/changelog.gz', 'usr/share/doc/dockdesk/README.md', 'opt/dockdesk/server.js', 'opt/dockdesk/pty-shell.py', 'usr/bin/dockdesk', 'usr/share/applications/dockdesk.desktop']) assert.ok(files.includes(f), `missing ${f}`)
