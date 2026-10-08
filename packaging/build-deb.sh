@@ -58,4 +58,4 @@ Description: Lightweight Docker Desktop alternative
  palette. It controls the Docker engine already installed on the machine; it does
  not bundle one.
 C
-dpkg-deb --root-owner-group --build "$R" "dist/dockdesk_${VER}_all.deb"
+dpkg-deb --root-owner-group -Zxz --build "$R" "dist/dockdesk_${VER}_all.deb"

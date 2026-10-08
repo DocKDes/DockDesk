@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- File browser works on stopped containers and images with no `ls` (scratch, distroless) by reading the filesystem archive.
+- Memory and CPU limits can now be removed from the container's Settings tab (the container is recreated with the same settings, volumes and networks; the original is restored on failure).
+- The Compose error and Settings → Engine show the install command for your distro.
+- Overview → Clean up: each row (unused images, stopped containers, unused volumes, unused networks) now opens its page already filtered to what would be removed. Containers gained an "Only show stopped" switch.
+- After being added to the `docker` group, the app offers to restart itself with the group applied instead of asking for a logout.
+
 ## 0.1.1 (2026-10-07)
 
 - Published on npm: `npx dockdesk` to try it, `npm install -g dockdesk` to install (Linux, Node 18.17+). The package has no dependencies and no install scripts.

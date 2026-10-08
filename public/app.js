@@ -250,7 +250,10 @@ async function checkDaemon() {
     let d = {}
     try { d = await api('engine.diag') } catch {}
     const cmd = `sudo usermod -aG docker ${d.user || '$USER'}`
-    if (d.exists && !d.access) {
+    if (d.exists && !d.access && d.groupPending) {
+      html = `<div>${ic('info', 18)}</div><div class="bn"><b>Docker access is waiting for a new login</b>
+        <div>You were added to the <span class="mono">docker</span> group, but this session started before that, so it can't use Docker yet. ${d.canRelaunch ? 'DockDesk can restart itself with the group applied. No need to log out.' : 'Log out and back in, or start DockDesk with <span class="mono">sg docker -c dockdesk</span>.'}</div></div>${d.canRelaunch ? tbtn('restart', 'Restart with Docker access', call('relaunch'), 'pri') : ''}`
+    } else if (d.exists && !d.access) {
       html = `<div>${ic('info', 18)}</div><div class="bn"><b>No permission to use Docker</b>
         <div>Your user can't open <span class="mono">${esc(d.socket)}</span>. ${d.inDockerGroup ? 'You are already in the <span class="mono">docker</span> group, so log out and back in (or run <span class="mono">newgrp docker</span>) to apply it.' : 'Add yourself to the <span class="mono">docker</span> group, then log out and back in:'}</div>
         ${d.inDockerGroup ? '' : `<div class="cmd"><span class="mono">${esc(cmd)}</span>${ibtn('copy', 'Copy command', call('copy', cmd))}</div>`}</div>`
@@ -328,6 +331,17 @@ document.addEventListener('click', async (e) => {
       case 'copy': return (await copyText(args[0])) ? toast('Copied') : toast('Could not copy', true)
       case 'bulk': return bulk(args[0])
       case 'bulkclear': sel.clear(); $('#rows').innerHTML = containerRows(); return afterContainers()
+      case 'showunused': { // [page, filter]: open that page with its filter preset
+        const [page, f] = args
+        if (page === 'images') ifilter = f
+        else if (page === 'containers') { onlyRunning = false; onlyStopped = true }
+        else gf[page] = f
+        return go(page)
+      }
+      case 'relaunch':
+        toast('Restarting DockDesk with Docker access…')
+        try { await api('app.relaunch') } catch (err) { toast(err.message, true) } // on success this page's server exits and a new window opens
+        return
       case 'engine':
         if (engine.up) { if (!confirm('Stop the Docker daemon? All containers will stop. You may be asked for your password.')) return; return act('Stopping Docker…', () => api('daemon.stop'), checkDaemon) }
         return act('Starting Docker…', () => api('daemon.start'), checkDaemon)
@@ -616,7 +630,7 @@ async function settingsPage() {
       ${row('Docker Engine', esc(info.OperatingSystem), val('v' + info.ServerVersion))}
       ${row('Storage driver', 'Docker root: ' + esc(info.DockerRootDir), val(info.Driver))}
       ${row('Socket', 'The Unix socket DockDesk talks to.', val(d.socket))}
-      ${row('Docker Compose', d.compose ? 'Needed for the Compose page and editor.' : 'Not found. The Compose page and editor need it: install “docker-compose-v2” (Ubuntu), “docker-compose” (Debian 13, Kali) or “docker-compose-plugin” (Docker’s repository).', d.compose ? val('v' + d.compose) : '<span class="pill warn">Not installed</span>')}
+      ${row('Docker Compose', d.compose ? 'Needed for the Compose page and editor.' : d.composeHint ? `Not found. The Compose page and editor need it. On ${esc(d.composeHint.distro)}, install it with <span class="mono">${esc(d.composeHint.cmd)}</span>${esc(d.composeHint.note)}. ${ibtn('copy', 'Copy command', call('copy', d.composeHint.cmd))}` : 'Not found. The Compose page and editor need it: install “docker-compose-v2” (Ubuntu), “docker-compose” (Debian 13, Kali) or “docker-compose-plugin” (Docker’s repository).', d.compose ? val('v' + d.compose) : '<span class="pill warn">Not installed</span>')}
       ${row('Docker Buildx', 'Optional. Used by image builds when present.', d.buildx ? val(d.buildx.split(' ').find((x) => /^v?\d/.test(x)) || 'installed') : '<span class="pill">Not installed</span>')}
       ${row('Access', 'Your user is ' + esc(d.user) + '.', d.access ? '<span class="pill running">OK</span>' : '<span class="pill warn">No permission</span>')}
       ${row('Start / stop without a password', 'Starting or stopping the engine asks for your password by default. Install this one-time rule to let docker-group members skip it (scoped to docker.service). Undo: sudo rm /etc/polkit-1/rules.d/50-dockdesk.rules', tbtn('copy', 'Copy setup command', call('copyrule')))}
@@ -734,7 +748,8 @@ async function dashboard() {
   const projUp = Object.values(projects).filter((l) => l.some((c) => c.State === 'running')).length
   const labsUp = LABS.filter((l) => cs.some((c) => c.Labels?.['dockdesk.lab'] === l.id && c.State === 'running')).length
   const tile = (page, icon, label, big, sub) => `<div class="tile" data-call='${esc(call('goto', page))}' role="link" tabindex="0">${ic(icon, 18)}<div><div class="k">${label}</div><div class="v">${big}</div><div class="s">${sub}</div></div></div>`
-  const clean = (label, sub, right, callJson) => `<div class="crow"><div><div class="nm">${label}</div><div class="meta">${sub}</div></div><div class="num nw">${right}</div>${tbtn('broom', 'Clean', callJson)}</div>`
+  // The left part is a button that opens the matching page already filtered to the unused items, so you can see what Clean would remove
+  const clean = (label, sub, right, callJson, page, filter) => `<div class="crow"><button type="button" class="cgo" title="Show them" data-call='${esc(call('showunused', page, filter))}'><span class="nm">${label}${ic('chevright', 13)}</span><span class="meta">${sub}</span></button><div class="num nw">${right}</div>${tbtn('broom', 'Clean', callJson)}</div>`
   const sizeOrNone = (n) => (n > 0 ? fmt(n) : '<span class="meta">nothing to clean</span>')
   const volUnused = (df.Volumes || []).filter((v) => v.UsageData?.RefCount === 0).length
   const stopped = cs.filter((c) => c.State !== 'running').length
@@ -754,10 +769,10 @@ async function dashboard() {
           <div class="stack">${seg.map(([k, , col]) => `<i style="width:${(D[k].total / grand) * 100}%;background:${col}" title="${k}"></i>`).join('')}</div>
           <div class="legend">${seg.map(([k, l, col]) => `<div class="lg"><span class="sw" style="background:${col}"></span><div><div class="nm">${l}</div><div class="meta">${fmt(D[k].total)} · ${D[k].n} item${D[k].n === 1 ? '' : 's'}</div></div></div>`).join('')}</div>
           <div class="dsub">Clean up</div>
-          ${clean('Unused images', imgUnused.length + ' of ' + D.images.n + ' not used by any container', sizeOrNone(D.images.rec), call('confirm', 'Remove ALL images that no container uses? They can be pulled again.', 'images.prune', true))}
-          ${clean('Stopped containers', stopped + ' stopped', sizeOrNone(D.containers.rec), call('confirm', 'Remove all stopped containers?', 'containers.prune'))}
-          ${clean('Unused volumes', volUnused + ' of ' + D.volumes.n + ' unused · deleting loses their data', sizeOrNone(D.volumes.rec), call('confirm', 'Remove ALL unused volumes? Their data will be lost.', 'volumes.prune'))}
-          ${clean('Unused networks', 'custom networks no container uses', '<span class="meta">–</span>', call('confirm', 'Remove unused networks?', 'networks.prune'))}
+          ${clean('Unused images', imgUnused.length + ' of ' + D.images.n + ' not used by any container', sizeOrNone(D.images.rec), call('confirm', 'Remove ALL images that no container uses? They can be pulled again.', 'images.prune', true), 'images', 'unused')}
+          ${clean('Stopped containers', stopped + ' stopped', sizeOrNone(D.containers.rec), call('confirm', 'Remove all stopped containers?', 'containers.prune'), 'containers', 'stopped')}
+          ${clean('Unused volumes', volUnused + ' of ' + D.volumes.n + ' unused · deleting loses their data', sizeOrNone(D.volumes.rec), call('confirm', 'Remove ALL unused volumes? Their data will be lost.', 'volumes.prune'), 'volumes', 'unused')}
+          ${clean('Unused networks', 'custom networks no container uses', '<span class="meta">–</span>', call('confirm', 'Remove unused networks?', 'networks.prune'), 'networks', 'unused')}
         </div>
       </div>
       <div class="dcol">
@@ -777,12 +792,12 @@ async function dashboard() {
 // ---------- Containers ----------
 const cname = (c) => (c.Names?.[0] || c.Id.slice(0, 12)).replace(/^\//, '')
 const pubPorts = (c) => [...new Map((c.Ports || []).filter((p) => p.PublicPort).map((p) => [p.PublicPort, p])).values()]
-let cq = '', onlyRunning = false, cList = []
+let cq = '', onlyRunning = false, onlyStopped = false, cList = []
 const sel = new Set() // selected container ids (survives re-renders)
 
 const visible = () => {
   const q = cq.toLowerCase()
-  return cList.filter((c) => (!onlyRunning || c.State === 'running') && (!q || (cname(c) + ' ' + c.Image + ' ' + c.Id).toLowerCase().includes(q)))
+  return cList.filter((c) => (!onlyRunning || c.State === 'running') && (!onlyStopped || c.State !== 'running') && (!q || (cname(c) + ' ' + c.Image + ' ' + c.Id).toLowerCase().includes(q)))
 }
 
 function containerRows() {
@@ -816,6 +831,7 @@ async function containers() {
     <div class="tools">
       <label class="search">${ic('search', 15)}<input type="text" id="cq" placeholder="Search" value="${esc(cq)}"></label>
       <label class="switch"><input type="checkbox" id="crun" ${onlyRunning ? 'checked' : ''}>Only show running containers</label>
+      <label class="switch"><input type="checkbox" id="cstop" ${onlyStopped ? 'checked' : ''}>Only show stopped</label>
     </div>
     <div id="bulk"></div>` +
     (cList.length
@@ -847,7 +863,11 @@ document.addEventListener('input', (e) => {
 })
 document.addEventListener('change', (e) => {
   const t = e.target
-  if (t.id === 'crun') { onlyRunning = t.checked; lastHtml = ''; $('#rows').innerHTML = containerRows(); afterContainers() }
+  if (t.id === 'crun' || t.id === 'cstop') {
+    if (t.id === 'crun') { onlyRunning = t.checked; if (t.checked) onlyStopped = false } else { onlyStopped = t.checked; if (t.checked) onlyRunning = false }
+    $('#crun').checked = onlyRunning; $('#cstop').checked = onlyStopped
+    lastHtml = ''; $('#rows').innerHTML = containerRows(); afterContainers()
+  }
   else if (t.id === 'selall') { visible().forEach((c) => (t.checked ? sel.add(c.Id) : sel.delete(c.Id))); $('#rows').innerHTML = containerRows(); afterContainers() }
   else if (t.classList.contains('sel')) { t.checked ? sel.add(t.dataset.id) : sel.delete(t.dataset.id); updateBulk() }
 })
@@ -1484,7 +1504,7 @@ const matchUse = (f, used) => f === 'all' || (f === 'inuse' && used) || (f === '
 
 const volSize = (v) => (v.UsageData?.Size >= 0 ? v.UsageData.Size : 0)
 const visibleVolumes = () => vList.filter((v) => matchUse(gf.volumes, v.usedBy.length > 0) && (!gq.volumes || v.Name.toLowerCase().includes(gq.volumes.toLowerCase())))
-const visibleNetworks = () => nList.filter((n) => matchUse(gf.networks, Object.keys(n.Containers || {}).length > 0) && (!gq.networks || n.Name.toLowerCase().includes(gq.networks.toLowerCase())))
+const visibleNetworks = () => nList.filter((n) => matchUse(gf.networks, Object.keys(n.Containers || {}).length > 0) && !(gf.networks === 'unused' && SYSTEM_NETS.has(n.Name)) && (!gq.networks || n.Name.toLowerCase().includes(gq.networks.toLowerCase())))
 
 const GPAGES = {
   volumes: { rows: visibleVolumes, key: (v) => v.Name, selectable: () => true, del: 'volume.remove', noun: 'volume', redraw: () => ($('#grows').innerHTML = volumeRows()) },
@@ -1751,6 +1771,7 @@ function filesTab(pane, info) {
     try {
       const d = await api('container.ls', id, p)
       cwd = d.path; sync()
+      if (d.source === 'archive') { note.hidden = false; note.innerHTML = `${ic('info', 16)}<div>Listed from the container's filesystem, because it is stopped or has no <span class="mono">ls</span>.${d.partial ? ' This folder is very large, so the list may be incomplete.' : ''}</div>` }
       list.innerHTML = (cwd !== '/' ? `<div class="frow" data-name=".." data-type="d"><span class="ficon dir">${ic('folder', 16)}</span><span class="fname">..</span></div>` : '') + (d.entries.map(rowHtml).join('') || '<div class="meta fpad">This folder is empty.</div>')
     } catch (e) {
       cwd = p; sync(); list.innerHTML = ''
@@ -1817,8 +1838,17 @@ function containerSettings(pane, info) {
     <label class="fld">Restart policy<select id="cs-restart">${[['no', 'Never'], ['unless-stopped', 'Unless stopped'], ['always', 'Always'], ['on-failure', 'On failure']].map(([v, l]) => `<option value="${v}" ${pol === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
     <div class="two"><label class="fld">Memory limit (MB)<input type="text" id="cs-mem" value="${mem}" placeholder="unlimited" inputmode="numeric"></label>
     <label class="fld">CPUs<input type="text" id="cs-cpu" value="${cpu}" placeholder="unlimited" inputmode="decimal"></label></div>
-    <div class="meta">Applies immediately, without restarting the container. Docker can raise or lower a limit but can't remove one from an existing container: leave a field unchanged to keep it, or recreate the container to go back to unlimited.</div>
-    <div><button class="tb pri" id="cs-save">${ic('copy', 15)}<span>Save changes</span></button></div></form>`
+    <div class="meta">Applies immediately, without restarting the container. Docker can raise or lower a limit but can't remove one from an existing container: leave a field unchanged to keep it, or remove the limit below.</div>
+    <div><button class="tb pri" id="cs-save">${ic('copy', 15)}<span>Save changes</span></button></div>
+    ${hc.Memory || hc.NanoCpus ? `<div class="limits"><div class="meta">Remove a limit: DockDesk recreates the container with the same settings, volumes and networks (${info.State.Running ? 'it is stopped and started again, so it restarts briefly' : 'it stays stopped'}). The old one is kept until the new one works. Changes made inside the container's filesystem are lost.</div>
+      <div class="row">${hc.Memory ? `<button type="button" class="tb" id="cs-nomem">${ic('trash', 15)}<span>Remove memory limit</span></button>` : ''}${hc.NanoCpus ? `<button type="button" class="tb" id="cs-nocpu">${ic('trash', 15)}<span>Remove CPU limit</span></button>` : ''}</div></div>` : ''}</form>`
+  const removeLimit = async (what, label) => {
+    if (!confirm(`Remove the ${label} limit? The container will be recreated (files you changed inside it are lost; volumes are kept).`)) return
+    toast('Recreating the container…')
+    try { const r = await api('container.removeLimits', info.Id, what); toast('Limit removed'); window.refresh?.(); openDetail(r.id, 'Settings') } catch (err) { toast(err.message, true) }
+  }
+  if ($('#cs-nomem', pane)) $('#cs-nomem', pane).onclick = () => removeLimit({ memory: true }, 'memory')
+  if ($('#cs-nocpu', pane)) $('#cs-nocpu', pane).onclick = () => removeLimit({ cpus: true }, 'CPU')
   $('.cform', pane).onsubmit = async (e) => {
     e.preventDefault()
     try {

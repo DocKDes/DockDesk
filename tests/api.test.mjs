@@ -141,6 +141,30 @@ describe('DockDesk API against real Docker', { skip: dockerAvailable() ? false :
       await assert.rejects(srv.call('container.update', r.id, { name: 'bad name!', restart: 'no' }), /Invalid container name/)
       docker('rm', '-f', r.id)
     })
+    it('removes memory and CPU limits by recreating the container, keeping its settings and data', async () => {
+      const net = `${PREFIX}-limnet`; docker('network', 'create', net)
+      const name = `${PREFIX}-lim`
+      const first = docker('run', '-d', '--name', name, '--stop-timeout', '1', '--memory', '64m', '--cpus', '1', '-e', 'KEEP=yes', '--network', net, '--network-alias', 'limalias', '-v', '/data', '--restart', 'unless-stopped', '--entrypoint', 'sh', IMG, '-c', 'echo saved > /data/f; sleep 300')
+      try {
+        await new Promise((r) => setTimeout(r, 800))
+        const show = () => JSON.parse(execFileSync('docker', ['inspect', name], { encoding: 'utf8' }))[0]
+        await srv.call('container.removeLimits', first, { memory: true })
+        let i = show(); assert.notEqual(i.Id, first); assert.equal(i.HostConfig.Memory, 0); assert.equal(i.HostConfig.NanoCpus, 1e9, 'only the memory limit was removed')
+        assert.equal(i.State.Running, true); assert.ok(i.Config.Env.includes('KEEP=yes')); assert.equal(i.HostConfig.RestartPolicy.Name, 'unless-stopped')
+        assert.ok(i.NetworkSettings.Networks[net]?.Aliases.includes('limalias'), 'network and alias are kept')
+        assert.equal(execFileSync('docker', ['exec', name, 'cat', '/data/f'], { encoding: 'utf8' }).trim(), 'saved', 'anonymous volume data survives')
+        assert.equal(dockerTry('ps', '-aq', '--filter', `id=${first}`), '', 'the old container is gone')
+        await srv.call('container.removeLimits', i.Id, { cpus: true })
+        i = show(); assert.equal(i.HostConfig.NanoCpus, 0); assert.equal(i.State.Running, true)
+        await assert.rejects(srv.call('container.removeLimits', i.Id, {}), /Choose which limit/)
+        assert.equal(dockerTry('ps', '-a', '--filter', `name=${name}-dockdesk-old`, '-q'), '', 'no leftover copies')
+      } finally { dockerTry('rm', '-f', '-v', name); dockerTry('network', 'rm', net) }
+    })
+    it('refuses to recreate compose-managed containers', async () => {
+      const c = docker('run', '-d', '--name', `${PREFIX}-cmp`, '--memory', '64m', '--label', 'com.docker.compose.project=x', '--stop-timeout', '1', '--entrypoint', 'sleep', IMG, '300')
+      try { await assert.rejects(srv.call('container.removeLimits', c, { memory: true }), /Compose project/) } finally { dockerTry('rm', '-f', c) }
+    })
+    it('will not restart itself in headless mode', async () => { await assert.rejects(srv.call('app.relaunch'), /Headless/) })
   })
 
   describe('volumes and networks', () => {
@@ -235,7 +259,20 @@ describe('DockDesk API against real Docker', { skip: dockerAvailable() ? false :
     it('explains why a folder cannot be listed', async () => {
       await assert.rejects(srv.call('container.ls', main, '/nope'), /No such file/)
       const created = `${PREFIX}-tinyc`; docker('create', '--name', created, tinyTag, '/hello.txt')
-      await assert.rejects(srv.call('container.ls', created, '/'), /Start the container/)
+      await assert.rejects(srv.call('container.ls', created, '/nope'), /Could not find|No such/i)
+    })
+    it('lists from the archive when the container is stopped or has no ls', async () => {
+      const created = `${PREFIX}-tinyc2`; docker('create', '--name', created, tinyTag, '/hello.txt') // stopped, and the image has no ls at all
+      const r = await srv.call('container.ls', created, '/'); assert.equal(r.source, 'archive'); assert.ok(r.entries.some((e) => e.name === 'hello.txt' && e.type === '-' && e.size > 0), JSON.stringify(r.entries))
+      const stopped = `${PREFIX}-stoplist`
+      docker('run', '--name', stopped, IMG, 'sh', '-c', 'mkdir -p "/d/sub dir" && echo hi > /d/a.txt && ln -s a.txt /d/l && touch "/d/my file" && chmod 750 /d/a.txt')
+      const d = await srv.call('container.ls', stopped, '/d'); const by = Object.fromEntries(d.entries.map((e) => [e.name, e]))
+      assert.equal(d.source, 'archive'); assert.equal(d.partial, false)
+      assert.deepEqual(d.entries.map((e) => e.name), ['sub dir', 'a.txt', 'l', 'my file'], 'folders first, then by name; nothing from deeper levels')
+      assert.equal(by['sub dir'].type, 'd'); assert.equal(by['l'].type, 'l'); assert.equal(by['l'].target, 'a.txt'); assert.equal(by['a.txt'].size, 3); assert.equal(by['a.txt'].perms, 'rwxr-x---')
+      assert.deepEqual((await srv.call('container.ls', stopped, '/d/sub dir')).entries, [])
+      const root = await srv.call('container.ls', stopped, '/'); assert.ok(['d', 'etc', 'bin'].every((n) => root.entries.some((e) => e.name === n)), 'the root lists its top-level folders')
+      await assert.rejects(srv.call('container.ls', stopped, '/missing'), /Could not find|No such/i)
     })
     it('previews text, flags binary files and folders, and truncates big files', async () => {
       assert.deepEqual(await srv.call('container.cat', main, '/tmp/demo/notes.txt'), { kind: 'file', size: 18, truncated: false, binary: false, text: 'line one\nline two\n' })

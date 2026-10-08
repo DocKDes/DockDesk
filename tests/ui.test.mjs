@@ -72,6 +72,43 @@ describe('DockDesk UI in a real browser', { skip }, () => {
     await page.set('#cq', '')
   })
 
+  it('Overview clean-up rows open the matching page filtered to what would be removed', async () => {
+    const stoppedName = `${PREFIX}-zstop`; docker('create', '--name', stoppedName, IMG, 'true')
+    try {
+    await nav('dashboard'); await page.waitFor(`document.querySelectorAll('.crow .cgo').length === 4`)
+    await page.clickText('.crow .cgo', 'Stopped containers'); await page.waitFor(`document.querySelector('#nav a.on').dataset.p === 'containers' && document.querySelector('#cstop')?.checked`)
+    assert.ok(await page.eval(`[...document.querySelectorAll('#rows tr')].some(r=>r.textContent.includes('${stoppedName}'))`), 'the stopped container is listed')
+    assert.ok(!(await page.eval(`[...document.querySelectorAll('#rows tr')].some(r=>r.textContent.includes('${main}'))`)), 'running containers are hidden')
+    await page.click('#crun'); assert.equal(await page.eval(`document.querySelector('#cstop').checked`), false, 'the two switches are exclusive')
+    await page.click('#crun') // back to showing everything for the other tests
+    await page.eval(`document.querySelector('#crun').checked = false; document.querySelector('#crun').dispatchEvent(new Event('change', {bubbles:true}))`)
+    for (const [row, p, sel, val] of [['Unused images', 'images', '#ifilter', 'unused'], ['Unused volumes', 'volumes', '#gfilter', 'unused'], ['Unused networks', 'networks', '#gfilter', 'unused']]) {
+      await nav('dashboard'); await page.clickText('.crow .cgo', row)
+      await page.waitFor(`document.querySelector('#nav a.on').dataset.p === '${p}' && document.querySelector('${sel}')?.value === '${val}'`)
+    }
+    assert.ok(!(await page.eval(`[...document.querySelectorAll('#grows tr')].some(r=>/^\\s*(bridge|host|none)\\b/.test(r.textContent))`)), 'built-in networks are not listed as unused')
+    await page.eval(`document.querySelector('#gfilter').value='all'; document.querySelector('#gfilter').dispatchEvent(new Event('change',{bubbles:true}))`)
+    } finally {
+      dockerTry('rm', '-f', stoppedName)
+      await page.eval(`document.querySelector('#cstop') && (document.querySelector('#cstop').checked = false, document.querySelector('#cstop').dispatchEvent(new Event('change', {bubbles:true})))`).catch(() => {})
+      await nav('images'); await page.eval(`document.querySelector('#ifilter').value='all'; document.querySelector('#ifilter').dispatchEvent(new Event('change',{bubbles:true}))`)
+    }
+  })
+
+  it('container settings show well-spaced buttons to remove memory and CPU limits', async () => {
+    const lim = `${PREFIX}-zlim`; docker('run', '-d', '--name', lim, '--memory', '64m', '--cpus', '1', '--stop-timeout', '1', '--entrypoint', 'sleep', IMG, '300')
+    try {
+      await nav('containers'); await page.waitFor(`[...document.querySelectorAll('#rows tr')].some(r=>r.textContent.includes('${lim}'))`)
+      await page.eval(`[...document.querySelectorAll('#rows tr')].find(r=>r.textContent.includes('${lim}')).click()`)
+      await page.waitFor(`!!document.querySelector('.detail .tabs')`); await page.clickText('.detail .tabs a', 'Settings')
+      await page.waitFor(`!!document.querySelector('#cs-nomem') && !!document.querySelector('#cs-nocpu')`)
+      const gap = await page.eval(`(()=>{const a=document.querySelector('#cs-nomem').getBoundingClientRect(),b=document.querySelector('#cs-nocpu').getBoundingClientRect();return b.left>a.right?b.left-a.right:(b.top-a.bottom)})()`)
+      assert.ok(gap >= 8, `buttons need breathing room, gap was ${gap}px`)
+      const cleared = await page.eval(`(()=>{const s=document.querySelector('#cs-save').getBoundingClientRect(),l=document.querySelector('.limits').getBoundingClientRect();return l.top-s.bottom})()`)
+      assert.ok(cleared >= 8, `the remove-limit block must be separated from Save, was ${cleared}px`)
+    } finally { await reset(); dockerTry('rm', '-f', lim) }
+  })
+
   it('container drawer: overview, logs, stats, files, settings and inspect tabs all render', async () => {
     await openContainer()
     assert.deepEqual(await page.eval(`[...document.querySelectorAll('.detail .tabs a')].map(a=>a.textContent.trim())`), ['Overview', 'Logs', 'Stats', 'Files', 'Settings', 'Inspect'])
