@@ -1,11 +1,36 @@
 # Changelog
 
-## Unreleased
+## 0.1.2 (2026-10-09)
 
-- File browser works on stopped containers and images with no `ls` (scratch, distroless) by reading the filesystem archive.
-- Memory and CPU limits can now be removed from the container's Settings tab (the container is recreated with the same settings, volumes and networks; the original is restored on failure).
+**Images**
+- Scan an image for vulnerabilities with Trivy or Grype (whichever is installed), from the image menu or the new Vulnerabilities tab.
+- "Check for updates" compares each tag with its registry and marks images that have a newer version. "Compare" shows two images side by side (size, config, environment, layers).
+
+**Containers and the Run dialog**
+- Published-port links have a copy button, and the Run dialog warns when a host port is already in use (by another container or program).
+- Run dialog: save and load named presets, "Copy as Compose", and "Paste docker run…" to fill the form from a command.
+- Every dialog (Run, volume, network, tag, pull, build, push, export, import, sign-in, container settings, compose editor) has "Copy as command", showing the equivalent `docker` command.
+- Text files in a container can be edited and saved in place from the Files tab, keeping their permissions and owner.
+- The Files tab also works on stopped containers and on images with no `ls` (scratch, distroless).
+- Memory and CPU limits can be removed from a container's Settings tab (the container is recreated with the same settings, volumes and networks; the original is restored on failure).
+
+**Compose**
+- "View combined logs" streams every service of a project in one colour-coded view, with a filter and per-service toggles.
+- Start with profiles, pull or build images, restart or scale a single service, edit the project's `.env`, and see a dependency graph.
+- Compose actions now only accept compose files that belong to a project DockDesk may use.
 - The Compose error and Settings → Engine show the install command for your distro.
-- Overview → Clean up: each row (unused images, stopped containers, unused volumes, unused networks) now opens its page already filtered to what would be removed. Containers gained an "Only show stopped" switch.
+
+**Overview and cleanup**
+- Clean up has a build cache row and a "Clean everything" button (stopped containers, unused images, volumes, networks and build cache; shows the space reclaimed).
+- Each Clean up row opens its page already filtered to what would be removed, and Containers gained an "Only show stopped" switch.
+
+**App**
+- Keyboard shortcuts: press `?` for a cheat sheet; `g` then `o`/`m`/`c`/`i`/`v`/`n`/`l`/`a`/`s` jumps to a page, `t` toggles the terminal, `r` refreshes.
+- Update checker (Settings → Updates): asks registry.npmjs.org for the newest version, only when you press the button or, if you turn it on, once a day. It shows how to update for your kind of install and adds a pill to the status bar. It never downloads or installs anything.
+- Languages: Spanish, French, German and Hindi for the menus, page titles, status bar and Settings; the rest stays English. More can be added in `public/i18n.js`.
+- Optional system tray icon (Settings → General): keeps DockDesk running in the tray when you close the window, with a menu to open it and to start or stop Docker or all containers. Needs python3-gi and an AppIndicator library (the `.deb` suggests them).
+- Settings backup: export your settings, theme, language and saved Run presets to a file and import them elsewhere.
+- CPU and memory alerts notify when a container stays above a threshold for about 15 seconds.
 - After being added to the `docker` group, the app offers to restart itself with the group applied instead of asking for a logout.
 
 ## 0.1.1 (2026-10-07)

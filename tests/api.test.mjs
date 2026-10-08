@@ -311,6 +311,43 @@ describe('DockDesk API against real Docker', { skip: dockerAvailable() ? false :
     })
   })
 
+  describe('edit files in a container, port check, image updates', () => {
+    const stat = (path) => dockerTry('exec', main, 'stat', '-c', '%a %u:%g', path)
+    it('saves text over a file and keeps its permissions and owner', async () => {
+      docker('exec', main, 'sh', '-c', 'printf "old\\n" > /tmp/demo/edit.txt; chmod 640 /tmp/demo/edit.txt; chown 1234:5678 /tmp/demo/edit.txt')
+      assert.equal(await srv.call('container.write', main, '/tmp/demo/edit.txt', 'new text\nsecond line é\n'), 'ok')
+      assert.equal(docker('exec', main, 'cat', '/tmp/demo/edit.txt'), 'new text\nsecond line é')
+      assert.equal(stat('/tmp/demo/edit.txt'), '640 1234:5678')
+      assert.equal((await srv.call('container.cat', main, '/tmp/demo/edit.txt')).text, 'new text\nsecond line é\n')
+    })
+    it('refuses folders, relative paths and large content', async () => {
+      await assert.rejects(srv.call('container.write', main, '/tmp/demo', 'x'), /not a regular file/)
+      await assert.rejects(srv.call('container.write', main, 'relative.txt', 'x'), /absolute/)
+      await assert.rejects(srv.call('container.write', main, '/tmp/demo/edit.txt', 'x'.repeat(256 * 1024 + 1)), /256 kB/)
+      await assert.rejects(srv.call('container.write', main, '/tmp/demo/missing-file.txt', 'x'), /Could not find/)
+    })
+    it('reports host ports that are taken', async () => {
+      const srv2 = net.createServer(); await new Promise((ok) => srv2.listen(0, '127.0.0.1', ok))
+      const busy = srv2.address().port
+      try {
+        const r = await srv.call('ports.check', [busy, 'x', -1, 70000])
+        assert.deepEqual(Object.keys(r), [String(busy)]); assert.equal(r[busy], 'another program')
+      } finally { srv2.close() }
+      const free = await new Promise((ok) => { const t = net.createServer(); t.listen(0, '127.0.0.1', () => { const n = t.address().port; t.close(() => ok(n)) }) })
+      assert.deepEqual(await srv.call('ports.check', [free]), {})
+    })
+    it('reports docker published ports by container name', async () => {
+      const name = `${PREFIX}-pc`
+      docker('run', '-d', '--name', name, '--stop-timeout', '1', '-p', '127.0.0.1::8080', '--entrypoint', 'sleep', IMG, '30')
+      const port = Number(docker('port', name, '8080/tcp').split(':').pop())
+      assert.equal((await srv.call('ports.check', [port]))[port], name)
+    })
+    it('says "cannot tell" for local images and bad references, without any network access', async () => {
+      assert.equal((await srv.call('image.update.check', tinyTag)).update, null)
+      for (const bad of ['', '--help', '-x', 'a b', 'x;id', 'sha256:' + 'a'.repeat(64)]) assert.equal((await srv.call('image.update.check', bad)).update, null)
+    })
+  })
+
   describe('logs', () => {
     const dl = (q) => fetch(`${srv.base}/download/logs?id=${main}&${q}&t=${srv.token}`)
     it('downloads logs as a file: stdout and stderr, colour codes stripped', async () => {
@@ -368,6 +405,120 @@ describe('DockDesk API against real Docker', { skip: dockerAvailable() ? false :
       assert.equal(running().length, 3)
       assert.equal((await srv.sse('compose', { project: proj, file, verb: 'down' }, { ms: 120000 })).final.k, 'end')
       assert.deepEqual(running(), [])
+    })
+  })
+
+  describe('compose extras: profiles, graph, .env, per-service actions', { skip: composeAvailable() ? false : 'docker compose is not installed' }, () => {
+    const proj = `${PREFIX}-cx`
+    const svc = (name, extra = '') => `  ${name}:\n    image: ${IMG}\n    entrypoint: ["sleep","600"]\n    stop_grace_period: 1s\n${extra}`
+    const yaml = () => `services:\n${svc('db')}${svc('web', '    depends_on:\n      - db\n')}${svc('extra', '    profiles: ["tools"]\n    depends_on:\n      - web\n')}`
+    let dir, file
+    const names = () => dockerTry('ps', '--filter', `label=com.docker.compose.project=${proj}`, '--format', '{{.Label "com.docker.compose.service"}}').split('\n').filter(Boolean).sort()
+    it('reads profiles and the dependency graph without starting anything', async () => {
+      const r = await srv.call('compose.save', proj, yaml()); dir = r.dir; file = r.file
+      assert.deepEqual(await srv.call('compose.profiles', file), ['tools'])
+      const g = await srv.call('compose.graph', file), by = Object.fromEntries(g.map((x) => [x.name, x]))
+      assert.deepEqual(by.web.depends, ['db']); assert.deepEqual(by.extra.depends, ['web']); assert.deepEqual(by.extra.profiles, ['tools']); assert.deepEqual(by.db.depends, [])
+      await assert.rejects(srv.call('compose.graph', '/etc/hosts'), /not one DockDesk may use/)
+      await assert.rejects(srv.call('compose.profiles', '/etc/hosts'), /not one DockDesk may use/)
+    })
+    it('edits the .env next to a compose file, privately, with a backup', async () => {
+      assert.deepEqual(await srv.call('compose.env.read', file), { file: join(dir, '.env'), exists: false, text: '', writable: true })
+      await srv.call('compose.env.write', file, 'A=1\n'); assert.equal(statSync(join(dir, '.env')).mode & 0o777, 0o600)
+      await srv.call('compose.env.write', file, 'A=2\n'); assert.equal(readFileSync(join(dir, '.env.dockdesk.bak'), 'utf8'), 'A=1\n')
+      assert.equal((await srv.call('compose.env.read', file)).text, 'A=2\n')
+      await assert.rejects(srv.call('compose.env.write', '/etc/hosts', 'A=1'), /not one DockDesk may use/)
+      await assert.rejects(srv.call('compose.env.write', file, 'A\0B'), /not text/)
+    })
+    it('starts with a profile, restarts and scales one service, then removes everything', async () => {
+      await srv.call('compose.action', proj, dir, file, 'up'); assert.deepEqual(names(), ['db', 'web'])
+      await srv.call('compose.action', proj, dir, file, 'up', ['tools']); assert.deepEqual(names(), ['db', 'extra', 'web'])
+      const before = dockerTry('ps', '-q', '--filter', `label=com.docker.compose.project=${proj}`, '--filter', 'label=com.docker.compose.service=web')
+      await srv.call('compose.service', proj, dir, file, 'web', 'restart'); assert.equal(dockerTry('ps', '-q', '--filter', `label=com.docker.compose.project=${proj}`, '--filter', 'label=com.docker.compose.service=web'), before, 'same container, restarted')
+      await srv.call('compose.service', proj, dir, file, 'web', 'scale', 2); assert.deepEqual(names(), ['db', 'extra', 'web', 'web'])
+      await srv.call('compose.service', proj, dir, file, 'web', 'scale', 1); assert.deepEqual(names(), ['db', 'extra', 'web'])
+      await srv.call('compose.action', proj, dir, file, 'down', ['tools']); assert.deepEqual(names(), [])
+    })
+    it('validates every argument', async () => {
+      await assert.rejects(srv.call('compose.service', proj, dir, file, 'web', 'scale', 999), /0 to 50/)
+      await assert.rejects(srv.call('compose.service', proj, dir, file, 'web', 'scale', 'x'), /0 to 50/)
+      await assert.rejects(srv.call('compose.service', proj, dir, file, 'web', 'rm'), /bad action/)
+      await assert.rejects(srv.call('compose.service', proj, dir, file, '--x', 'restart'), /Invalid service/)
+      await assert.rejects(srv.call('compose.service', 'BAD', dir, file, 'web', 'restart'), /Invalid project/)
+      await assert.rejects(srv.call('compose.service', proj, dir, '/etc/hosts', 'web', 'restart'), /not one DockDesk may use/)
+      await assert.rejects(srv.call('compose.action', proj, dir, '/etc/hosts', 'up'), /not one DockDesk may use/)
+      await assert.rejects(srv.call('compose.action', proj, dir, file, 'up', ['--evil']), /Invalid profile/)
+    })
+  })
+
+  describe('app info, update check and system tray', () => {
+    const VERSION = JSON.parse(readFileSync(join(import.meta.dirname, '..', 'package.json'), 'utf8')).version
+    const fakeUpdateServer = (answer) => new Promise((ok) => {
+      const s = http.createServer((req, res) => { const a = answer(); res.writeHead(a.status || 200, { 'Content-Type': 'application/json' }); res.end(typeof a.body === 'string' ? a.body : JSON.stringify(a.body)) })
+      s.listen(0, '127.0.0.1', () => ok({ url: `http://127.0.0.1:${s.address().port}/latest`, close: () => s.close() }))
+    })
+    it('reports its version and how it was installed', async () => {
+      const i = await srv.call('app.info'); assert.equal(i.version, VERSION); assert.equal(i.install, 'source')
+    })
+    it('asks the update server and compares versions', async () => {
+      let body = { version: '99.1.0' }
+      const fake = await fakeUpdateServer(() => ({ body }))
+      const s = await startServer({ env: { DOCKDESK_UPDATE_URL: fake.url } })
+      try {
+        assert.deepEqual(await s.call('update.check'), { current: VERSION, latest: '99.1.0', newer: true, install: 'source' })
+        body = { version: VERSION }; assert.equal((await s.call('update.check')).newer, false, 'same version is not an update')
+        body = { version: '0.0.1' }; assert.equal((await s.call('update.check')).newer, false, 'an older version is not an update')
+        body = { version: '1.0.0-beta.1' }; assert.equal((await s.call('update.check')).latest, '1.0.0-beta.1')
+        body = { name: 'dockdesk' }; await assert.rejects(s.call('update.check'), /Unexpected answer/)
+        body = '<html>not json'; await assert.rejects(s.call('update.check'), /Unexpected answer/)
+      } finally { s.stop(); fake.close() }
+    })
+    it('explains update-server failures in plain words', async () => {
+      const bad = await fakeUpdateServer(() => ({ status: 503, body: {} }))
+      const s1 = await startServer({ env: { DOCKDESK_UPDATE_URL: bad.url } })
+      try { await assert.rejects(s1.call('update.check'), /answered 503/) } finally { s1.stop(); bad.close() }
+      const s2 = await startServer({ env: { DOCKDESK_UPDATE_URL: 'http://127.0.0.1:1/latest' } })
+      try { await assert.rejects(s2.call('update.check'), /Could not reach the update server/) } finally { s2.stop() }
+    })
+    // a fake tray program: logs every status line it gets, and with FAKE_QUIT=1 answers the first one with "quit"
+    const makeTray = (dir) => {
+      const f = join(dir, 'fake-tray'), log = join(dir, 'tray.log')
+      writeFileSync(f, `#!/usr/bin/env node\nconst fs=require('fs');fs.appendFileSync(${JSON.stringify(log)},'start '+process.argv.slice(2).join(' ')+'\\n')\nprocess.stdin.on('data',d=>{fs.appendFileSync(${JSON.stringify(log)},String(d));if(process.env.FAKE_QUIT==='1')console.log('quit')})\nprocess.on('SIGTERM',()=>{fs.appendFileSync(${JSON.stringify(log)},'sigterm\\n');process.exit(0)})\nsetInterval(()=>{},1000)\n`, { mode: 0o755 })
+      return { f, log, read: () => (existsSync(log) ? readFileSync(log, 'utf8') : '') }
+    }
+    it('turns the tray on and off, remembers it in a private config file, and feeds the tray the engine state', async () => {
+      const dir = J.tmp('tray'), tray = makeTray(dir), cfg = join(dir, 'config')
+      const s = await startServer({ env: { XDG_CONFIG_HOME: cfg, DOCKDESK_TRAY_CMD: tray.f } })
+      try {
+        assert.deepEqual(await s.call('tray.status'), { available: true, enabled: false, hint: (await s.call('tray.status')).hint })
+        assert.equal(tray.read(), '', 'nothing starts until it is switched on')
+        assert.deepEqual(await s.call('tray.set', true), { enabled: true })
+        await waitFor(() => /"engine":true,"running":\d+,"total":\d+/.test(tray.read()), { what: 'a status line to reach the tray' })
+        assert.match(tray.read(), /^start .*public/, 'gets the icon folder')
+        const file = join(cfg, 'dockdesk', 'config.json')
+        assert.equal(statSync(file).mode & 0o777, 0o600); assert.equal(statSync(join(cfg, 'dockdesk')).mode & 0o777, 0o700)
+        assert.equal(JSON.parse(readFileSync(file, 'utf8')).tray, true)
+        assert.equal((await s.call('tray.status')).enabled, true)
+        await s.call('tray.set', false)
+        await waitFor(() => tray.read().includes('sigterm'), { what: 'the tray to be stopped' })
+        assert.equal(await s.call('ping'), true, 'the server keeps running without the tray')
+        assert.equal(JSON.parse(readFileSync(file, 'utf8')).tray, false)
+        await assert.rejects(s.call('tray.set', 'yes'), /Invalid request/)
+      } finally { s.stop() }
+    })
+    it('starts the tray by itself when it was left on, and the tray can quit DockDesk', async () => {
+      const dir = J.tmp('tray2'), tray = makeTray(dir), cfg = join(dir, 'config')
+      mkdirSync(join(cfg, 'dockdesk'), { recursive: true }); writeFileSync(join(cfg, 'dockdesk', 'config.json'), '{"tray":true}')
+      const s = await startServer({ env: { XDG_CONFIG_HOME: cfg, DOCKDESK_TRAY_CMD: tray.f, FAKE_QUIT: '1' } })
+      const code = await new Promise((ok) => { s.proc.on('exit', ok); setTimeout(() => ok('still running'), 8000) })
+      assert.equal(code, 0, 'the tray asked DockDesk to quit')
+      assert.match(tray.read(), /"engine":true/)
+    })
+    it('survives a broken or hostile config file', async () => {
+      const dir = J.tmp('tray3'), cfg = join(dir, 'config')
+      mkdirSync(join(cfg, 'dockdesk'), { recursive: true }); writeFileSync(join(cfg, 'dockdesk', 'config.json'), '[1,2,3')
+      const s = await startServer({ env: { XDG_CONFIG_HOME: cfg } })
+      try { assert.equal(await s.call('ping'), true); assert.equal((await s.call('tray.status')).enabled, false) } finally { s.stop() }
     })
   })
 

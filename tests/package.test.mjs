@@ -34,7 +34,7 @@ describe('licence and metadata', () => {
     assert.match(r, /npm test/); assert.match(r, /packaging\/release\.sh/); assert.match(r, /package\.json/)
   })
   it('contains no personal paths in shipped files', () => {
-    for (const f of ['server.js', 'pty-shell.py', 'public/app.js', 'public/index.html', 'public/style.css', 'install.sh', 'uninstall.sh', 'README.md', 'packaging/build-deb.sh', 'packaging/release.sh']) {
+    for (const f of ['server.js', 'pty-shell.py', 'tray.py', 'public/app.js', 'public/index.html', 'public/style.css', 'install.sh', 'uninstall.sh', 'README.md', 'packaging/build-deb.sh', 'packaging/release.sh']) {
       const hits = (read(f).match(/\/home\/(?!you\b)[a-z][\w-]*/gi) || []); assert.deepEqual(hits, [], `${f} mentions a real home directory`)
     }
   })
@@ -65,7 +65,7 @@ describe('release artifacts', { skip: haveDpkg ? false : 'dpkg-deb is not instal
   })
   it('installs licence, notices, security policy, changelog and a Debian copyright file', () => {
     const files = sh('dpkg-deb', ['-c', deb])
-    for (const f of ['usr/share/doc/dockdesk/LICENSE', 'usr/share/doc/dockdesk/THIRD_PARTY_NOTICES.md', 'usr/share/doc/dockdesk/copyright', 'usr/share/doc/dockdesk/changelog.gz', 'usr/share/doc/dockdesk/README.md', 'opt/dockdesk/server.js', 'opt/dockdesk/pty-shell.py', 'usr/bin/dockdesk', 'usr/share/applications/dockdesk.desktop']) assert.ok(files.includes(f), `missing ${f}`)
+    for (const f of ['usr/share/doc/dockdesk/LICENSE', 'usr/share/doc/dockdesk/THIRD_PARTY_NOTICES.md', 'usr/share/doc/dockdesk/copyright', 'usr/share/doc/dockdesk/changelog.gz', 'usr/share/doc/dockdesk/README.md', 'opt/dockdesk/server.js', 'opt/dockdesk/pty-shell.py', 'opt/dockdesk/tray.py', 'opt/dockdesk/package.json', 'opt/dockdesk/public/i18n.js', 'usr/bin/dockdesk', 'usr/share/applications/dockdesk.desktop']) assert.ok(files.includes(f), `missing ${f}`)
     assert.ok(!/\/tests\//.test(files), 'tests are not shipped'); assert.ok(!/node_modules|\.git\//.test(files))
   })
   it('the launcher in the .deb starts a working server from the installed location', async () => {
@@ -84,7 +84,7 @@ describe('release artifacts', { skip: haveDpkg ? false : 'dpkg-deb is not instal
     for (const f of ['LICENSE', 'THIRD_PARTY_NOTICES.md', 'README.md', 'install.sh']) assert.ok(existsSync(join(src, f)), `tarball lacks ${f}`)
     const env = { ...process.env, HOME: home, XDG_DATA_HOME: '', XDG_CACHE_HOME: '' }
     assert.match(sh('sh', [join(src, 'install.sh')], { env }), /Installed/)
-    for (const f of ['.local/bin/dockdesk', '.local/share/dockdesk/server.js', '.local/share/dockdesk/pty-shell.py', '.local/share/dockdesk/public/index.html', '.local/share/applications/dockdesk.desktop']) assert.ok(existsSync(join(home, f)), `install.sh did not create ${f}`)
+    for (const f of ['.local/bin/dockdesk', '.local/share/dockdesk/server.js', '.local/share/dockdesk/pty-shell.py', '.local/share/dockdesk/tray.py', '.local/share/dockdesk/package.json', '.local/share/dockdesk/public/index.html', '.local/share/applications/dockdesk.desktop']) assert.ok(existsSync(join(home, f)), `install.sh did not create ${f}`)
     assert.match(readFileSync(join(home, '.local/share/applications/dockdesk.desktop'), 'utf8'), new RegExp(`Exec=${home.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/\\.local/bin/dockdesk`))
     const { spawn } = await import('node:child_process')
     const p = spawn(join(home, '.local/bin/dockdesk'), [], { env: { ...env, DOCKDESK_NO_OPEN: '1' }, stdio: ['ignore', 'pipe', 'pipe'] })
@@ -118,7 +118,7 @@ describe('npm package', { skip: haveNpm ? false : 'npm is not installed' }, () =
     for (const hook of ['preinstall', 'install', 'postinstall', 'prepare', 'prepublish', 'preuninstall', 'postuninstall']) assert.ok(!pkg.scripts?.[hook], `no ${hook} script`)
   })
   it('publishes the app and its licences, and nothing else', () => {
-    for (const f of ['server.js', 'pty-shell.py', 'bin/dockdesk', 'public/index.html', 'public/app.js', 'public/vendor/xterm.js', 'LICENSE', 'THIRD_PARTY_NOTICES.md', 'README.md', 'package.json']) assert.ok(files.includes(f), `missing ${f}`)
+    for (const f of ['server.js', 'pty-shell.py', 'tray.py', 'bin/dockdesk', 'public/index.html', 'public/app.js', 'public/vendor/xterm.js', 'LICENSE', 'THIRD_PARTY_NOTICES.md', 'README.md', 'package.json']) assert.ok(files.includes(f), `missing ${f}`)
     assert.ok(!files.some((f) => /^(tests|\.github|dist|node_modules|\.git)\//.test(f)), 'no tests, CI files, build output or git data')
     assert.ok(!files.some((f) => /\.(env|pem|key)$|\.dockdesk\.bak$/.test(f)), 'no secrets or backups')
     assert.ok(statSync(tgz).size < 300 * 1024, 'the tarball stays small')
