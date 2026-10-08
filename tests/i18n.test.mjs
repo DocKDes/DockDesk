@@ -3,10 +3,11 @@ import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { join, dirname } from 'node:path'
-import { fileURLToPath, pathToFileURL } from 'node:url'
+import { fileURLToPath } from 'node:url'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..', 'public')
-const { TR, LANGS } = await import(pathToFileURL(join(root, 'i18n.js')).href)
+// public/i18n.js is an ES module loaded by the browser; the package is not marked "type": "module", so older Node versions refuse to import it by path. A data: URL works everywhere.
+const { TR, LANGS } = await import('data:text/javascript;base64,' + readFileSync(join(root, 'i18n.js')).toString('base64'))
 const app = readFileSync(join(root, 'app.js'), 'utf8')
 
 // every English string handed to tr('…') or listed in a ternary inside tr(…)

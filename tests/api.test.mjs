@@ -6,6 +6,7 @@ import http from 'node:http'
 import { spawnSync, execFileSync } from 'node:child_process'
 import { writeFileSync, mkdirSync, statSync, readFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { randomBytes, createHash } from 'node:crypto'
 import { startServer, janitor, docker, dockerTry, dockerAvailable, composeAvailable, waitFor, sleep, PREFIX } from './helpers.mjs'
 
@@ -452,7 +453,7 @@ describe('DockDesk API against real Docker', { skip: dockerAvailable() ? false :
   })
 
   describe('app info, update check and system tray', () => {
-    const VERSION = JSON.parse(readFileSync(join(import.meta.dirname, '..', 'package.json'), 'utf8')).version
+    const VERSION = JSON.parse(readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8')).version
     const fakeUpdateServer = (answer) => new Promise((ok) => {
       const s = http.createServer((req, res) => { const a = answer(); res.writeHead(a.status || 200, { 'Content-Type': 'application/json' }); res.end(typeof a.body === 'string' ? a.body : JSON.stringify(a.body)) })
       s.listen(0, '127.0.0.1', () => ok({ url: `http://127.0.0.1:${s.address().port}/latest`, close: () => s.close() }))
