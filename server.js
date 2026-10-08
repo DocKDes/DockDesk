@@ -110,7 +110,31 @@ function composeRun(args, stdin, cwd, ms = 30000) {
 
 // `docker compose` is a separate plugin; some distros ship none (Debian 12) or call it differently. Say so plainly.
 const COMPOSE_MISSING = /is not a docker command|unknown command: docker compose|docker: 'compose'/i
-const friendlyCompose = (msg) => (COMPOSE_MISSING.test(String(msg)) ? 'Docker Compose v2 is not installed. Install the "docker-compose-v2" package (Ubuntu), "docker-compose" (Debian 13, Kali) or "docker-compose-plugin" (Docker\'s own repository), then try again.' : msg)
+// What to install, for the distro we are running on (from /etc/os-release). null when we don't know the distro.
+let composeHintCache
+function composeHint() {
+  if (composeHintCache !== undefined) return composeHintCache
+  const rel = {}
+  try { for (const l of fs.readFileSync('/etc/os-release', 'utf8').split('\n')) { const m = /^(\w+)=(["']?)(.*)\2$/.exec(l); if (m) rel[m[1]] = m[3] } } catch {}
+  const ids = [rel.ID, ...(rel.ID_LIKE || '').split(/\s+/)].filter(Boolean), has = (...x) => x.some((i) => ids.includes(i))
+  const repo = " from Docker's apt repository (this release has no Compose v2 package of its own)"
+  let cmd = null, note = ''
+  if (rel.ID === 'kali') cmd = 'sudo apt install docker-compose'
+  else if (has('ubuntu')) cmd = 'sudo apt install docker-compose-v2'
+  else if (rel.ID === 'debian' && Number(rel.VERSION_ID) >= 13) cmd = 'sudo apt install docker-compose'
+  else if (has('debian')) { cmd = 'sudo apt install docker-compose-plugin'; note = repo }
+  else if (has('fedora', 'rhel', 'centos')) { cmd = 'sudo dnf install docker-compose-plugin'; note = " from Docker's repository" }
+  else if (has('arch')) cmd = 'sudo pacman -S docker-compose'
+  else if (has('suse', 'opensuse')) cmd = 'sudo zypper install docker-compose'
+  else if (has('alpine')) cmd = 'sudo apk add docker-cli-compose'
+  return (composeHintCache = cmd ? { distro: rel.PRETTY_NAME || rel.NAME || rel.ID || 'this system', cmd, note } : null)
+}
+const COMPOSE_GENERIC = 'Install the "docker-compose-v2" package (Ubuntu), "docker-compose" (Debian 13, Kali) or "docker-compose-plugin" (Docker\'s own repository)'
+const friendlyCompose = (msg) => {
+  if (!COMPOSE_MISSING.test(String(msg))) return msg
+  const h = composeHint()
+  return `Docker Compose v2 is not installed. ${h ? `On ${h.distro}, install it with: ${h.cmd}${h.note}` : COMPOSE_GENERIC}, then try again.`
+}
 
 // Docker event -> the small shape the UI uses (null for noise).
 function mapEvent(e) {
@@ -188,6 +212,90 @@ async function* tarEntry(r) {
       }
     }
   }
+}
+
+// Yields one header object per tar entry (data is skipped, never buffered). Handles PAX (x) and GNU (L/K) long names.
+async function* tarHeaders(r) {
+  const cstr = (b) => b.toString('utf8').replace(/\0[\s\S]*$/, '')
+  const oct = (b) => parseInt(cstr(b).trim() || '0', 8) || 0
+  let buf = Buffer.alloc(0), mode = 'header', left = 0, kind = '', parts = [], pax = {}, longName = null, longLink = null
+  for await (const chunk of r) {
+    buf = buf.length ? Buffer.concat([buf, chunk]) : chunk
+    for (;;) {
+      if (mode === 'header') {
+        if (buf.length < 512) break
+        const h = buf.subarray(0, 512); buf = buf.subarray(512)
+        if (h.every((b) => b === 0)) return
+        const type = String.fromCharCode(h[156] || 48), size = oct(h.subarray(124, 136)), padded = Math.ceil(size / 512) * 512
+        if ('xgLK'.includes(type)) { mode = 'collect'; kind = type; left = padded; parts = []; pax.__size = size; continue }
+        const prefix = h.subarray(257, 263).toString() === 'ustar\0' ? cstr(h.subarray(345, 500)) : ''
+        const name = pax.path ?? longName ?? ((prefix ? prefix + '/' : '') + cstr(h.subarray(0, 100)))
+        const e = { name, type, size: pax.size ?? size, mode: oct(h.subarray(100, 108)), uid: oct(h.subarray(108, 116)), gid: oct(h.subarray(116, 124)),
+          mtime: pax.mtime ?? oct(h.subarray(136, 148)), link: pax.linkpath ?? longLink ?? cstr(h.subarray(157, 257)), uname: cstr(h.subarray(265, 297)), gname: cstr(h.subarray(297, 329)) }
+        pax = {}; longName = longLink = null
+        yield e
+        if (type === '0' || type === '7') { mode = 'skip'; left = Math.ceil(e.size / 512) * 512; if (!left) mode = 'header' }
+      } else if (mode === 'skip' || mode === 'collect') {
+        const n = Math.min(left, buf.length)
+        if (mode === 'collect') parts.push(buf.subarray(0, n))
+        buf = buf.subarray(n); left -= n
+        if (left) break
+        if (mode === 'collect') {
+          const size = pax.__size, text = Buffer.concat(parts).subarray(0, size).toString('utf8')
+          if (kind === 'L') longName = text.replace(/\0[\s\S]*$/, '')
+          else if (kind === 'K') longLink = text.replace(/\0[\s\S]*$/, '')
+          else if (kind === 'x') {
+            // records look like "<len> key=value\n"
+            for (const m of text.matchAll(/\d+ ([^=\n]+)=([^\n]*)\n/g)) {
+              if (m[1] === 'path') pax.path = m[2]; else if (m[1] === 'linkpath') pax.linkpath = m[2]
+              else if (m[1] === 'size') pax.size = Number(m[2]) || 0; else if (m[1] === 'mtime') pax.mtime = Math.floor(Number(m[2])) || 0
+            }
+          }
+          delete pax.__size
+        }
+        mode = 'header'
+      } else break
+    }
+  }
+}
+
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+function lsDate(sec) { // same look as `ls -l`: time for recent files, year for old ones
+  const d = new Date(sec * 1000), recent = Math.abs(Date.now() - d.getTime()) < 182 * 864e5
+  return `${MONTHS[d.getMonth()]} ${String(d.getDate()).padStart(2)} ${recent ? `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}` : ` ${d.getFullYear()}`.trim()}`
+}
+function permString(mode) {
+  const c = ['---', '--x', '-w-', '-wx', 'r--', 'r-x', 'rw-', 'rwx']
+  let s = c[(mode >> 6) & 7] + c[(mode >> 3) & 7] + c[mode & 7]
+  if (mode & 0o4000) s = s.slice(0, 2) + (s[2] === 'x' ? 's' : 'S') + s.slice(3)
+  if (mode & 0o2000) s = s.slice(0, 5) + (s[5] === 'x' ? 's' : 'S') + s.slice(6)
+  if (mode & 0o1000) s = s.slice(0, 8) + (s[8] === 'x' ? 't' : 'T')
+  return s
+}
+
+// Folder listing without running anything inside the container: read the tar headers of the archive Docker serves for the folder.
+// This works for stopped containers and for images with no `ls` (scratch, distroless). Trade-off: tar has no "children only" query, so
+// a very large subtree is scanned until a limit and the listing may be partial.
+const LIST_MAX_HEADERS = 50000, LIST_MAX_MS = 8000
+async function archiveList(id, p) {
+  const dir = p.length > 1 ? p.replace(/\/+$/, '') : '/'
+  const r = await archiveReq(id, dir === '/' ? '/' : dir + '/.') // "/." also follows a symlink that points to a folder
+  const entries = [], deadline = Date.now() + LIST_MAX_MS
+  let scanned = 0, partial = false
+  try {
+    for await (const h of tarHeaders(r)) {
+      if (++scanned > LIST_MAX_HEADERS || Date.now() > deadline) { partial = true; break }
+      // Entry names are relative to the folder, e.g. "./", "./passwd", or "etc/passwd" depending on the Docker version: drop a leading "./", then the folder's own name when it prefixes everything
+      let rel = h.name.replace(/^(\.\/|\/)+/, '').replace(/\/+$/, '')
+      const base = dir === '/' ? '' : dir.split('/').pop()
+      if (base && (rel === base || rel.startsWith(base + '/'))) rel = rel.slice(base.length).replace(/^\//, '')
+      if (!rel || rel === '.' || rel.includes('/')) continue
+      const link = h.type === '2' ? h.link : null
+      entries.push({ type: { 5: 'd', 2: 'l', 3: 'c', 4: 'b', 6: 'p' }[h.type] || '-', perms: permString(h.mode), owner: h.uname || String(h.uid), group: h.gname || String(h.gid), size: h.type === '5' ? 0 : h.size, date: lsDate(h.mtime), name: rel, target: link })
+    }
+  } finally { r.destroy() }
+  entries.sort((a, b) => (b.type === 'd') - (a.type === 'd') || a.name.localeCompare(b.name))
+  return { path: p, entries, source: 'archive', partial }
 }
 
 function tarHeader(name, size) {
@@ -431,11 +539,17 @@ const handlers = {
   'container.ls': async (id, p) => {
     id = cid(id); p = cpath(p)
     let r
-    const friendly = (m) => /not running/i.test(m) ? 'Start the container to browse its files.'
-      : /executable file not found|not found in \$PATH/i.test(m) ? "This container has no ls command (a minimal or distroless image), so its files can't be listed."
-      : m
-    try { r = await execCollect(id, ['ls', '-lA', p.endsWith('/') ? p : p + '/']) } catch (e) { throw new Error(friendly(e.message)) }
-    if (r.code !== 0) throw new Error(friendly((r.err || r.out).trim().split('\n').pop() || 'Could not list that folder'))
+    // `ls` can't run in a stopped container or one with no ls: list from the archive instead (see archiveList)
+    const NO_LS = /not running|executable file not found|not found in \$PATH/i
+    try { r = await execCollect(id, ['ls', '-lA', p.endsWith('/') ? p : p + '/']) } catch (e) {
+      if (NO_LS.test(e.message)) return archiveList(id, p)
+      throw e
+    }
+    if (r.code !== 0) {
+      const msg = (r.err || r.out).trim().split('\n').pop() || 'Could not list that folder'
+      if (NO_LS.test(msg) || r.code === 126 || r.code === 127) return archiveList(id, p)
+      throw new Error(msg)
+    }
     const re = /^([-dlcbps])([rwxsStT-]{9})[.+@]?\s+\d+\s+(\S+)\s+(\S+)\s+(\d+(?:,\s*\d+)?)\s+(\w{3}\s+\d+\s+(?:\d{2}:\d{2}|\d{4}))\s+(.*)$/
     const entries = []
     for (const line of r.out.split('\n')) {
@@ -466,7 +580,10 @@ const handlers = {
     try { fs.accessSync(SOCK, fs.constants.R_OK | fs.constants.W_OK); access = true } catch {}
     const groups = (await run('id', ['-nG']).catch(() => '')).trim().split(/\s+/)
     const ver = async (args) => (await run('docker', args).catch(() => '')).trim().split('\n')[0] || null
-    return { socket: SOCK, exists, access, inDockerGroup: groups.includes('docker'), user: os.userInfo().username, compose: await ver(['compose', 'version', '--short']), buildx: (await ver(['buildx', 'version'])) }
+    // Added to the docker group (so /etc/group says yes) but this login session predates it: the app can restart itself with the group applied.
+    const me = os.userInfo(), g = await dockerGroup()
+    const groupPending = !groups.includes('docker') && !!g && (g.members.includes(me.username) || g.gid === me.gid)
+    return { socket: SOCK, exists, access, inDockerGroup: groups.includes('docker'), groupPending, canRelaunch: groupPending && !process.env.DOCKDESK_NO_OPEN, user: me.username, compose: await ver(['compose', 'version', '--short']), composeHint: composeHint(), buildx: (await ver(['buildx', 'version'])) }
   },
   // Docker Hub search via the daemon (so it honours the daemon's registry/proxy config).
   'hub.search': (term) => {
@@ -495,6 +612,65 @@ const handlers = {
     if (g.members.includes(u.name) === member) return 'unchanged'
     await run('pkexec', ['gpasswd', member ? '-a' : '-d', u.name, 'docker'])
     return 'ok'
+  },
+  // Group membership is fixed at login, so a user who was just added to `docker` has no access until they log in again.
+  // `sg docker` starts a process with the group applied right now: relaunch DockDesk that way, then close this copy.
+  'app.relaunch': async () => {
+    if (process.env.DOCKDESK_NO_OPEN) throw new Error('Headless mode: restart DockDesk yourself with: sg docker -c dockdesk')
+    const g = await dockerGroup(), me = os.userInfo()
+    if (!g || !(g.members.includes(me.username) || g.gid === me.gid)) throw new Error('Your user is not in the docker group yet')
+    const quote = (x) => { if (/['\0\n]/.test(x)) throw new Error('Cannot restart from a path with a quote in it'); return `'${x}'` } // both paths are ours, never user input
+    const child = spawn('sg', ['docker', '-c', `exec ${quote(process.execPath)} ${quote(__filename)}`], { detached: true, stdio: 'ignore', env: { ...process.env, DOCKDESK_WAIT_PID: String(process.pid) } })
+    await new Promise((resolve, reject) => {
+      child.once('error', (e) => reject(new Error(e.code === 'ENOENT' ? 'The "sg" command is missing, so DockDesk cannot restart itself. Log out and back in instead.' : e.message)))
+      child.once('exit', () => reject(new Error('Could not restart with the docker group. Log out and back in instead.')))
+      setTimeout(resolve, 800) // still alive after this long: it started
+    })
+    child.removeAllListeners('exit'); child.unref()
+    setTimeout(() => (appWindow ? appWindow.kill('SIGTERM') : process.exit(0)), 300) // closing the window ends this process (see openApp)
+    setTimeout(() => process.exit(0), 3000).unref()
+    return 'ok'
+  },
+  // Docker can't remove a memory/CPU limit from an existing container, so recreate it with the same settings minus the limit.
+  // The old container is only deleted once the new one is running; any failure puts the original back.
+  'container.removeLimits': async (id, what) => {
+    const clearMem = !!what?.memory, clearCpu = !!what?.cpus
+    if (!clearMem && !clearCpu) throw new Error('Choose which limit to remove')
+    const info = await dk('GET', `/containers/${seg(cid(id))}/json`), hc = info.HostConfig
+    if (info.Config.Labels?.['com.docker.compose.project']) throw new Error('This container belongs to a Compose project: remove the limit in its compose file and run Up again.')
+    if (hc.AutoRemove) throw new Error("A container started with --rm can't be recreated: it would be deleted when stopped.")
+    const name = info.Name.replace(/^\//, ''), wasRunning = !!info.State.Running
+    const body = structuredClone(info.Config)
+    body.HostConfig = structuredClone(hc)
+    if (clearMem) { body.HostConfig.Memory = 0; body.HostConfig.MemorySwap = 0 }
+    if (clearCpu) { body.HostConfig.NanoCpus = 0; body.HostConfig.CpuQuota = 0; body.HostConfig.CpuPeriod = 0 }
+    // keep the exact image the container was using, even if its tag has moved on since
+    body.Image = info.Config.Image
+    try { if ((await dk('GET', `/images/${seg(body.Image)}/json`)).Id !== info.Image) body.Image = info.Image } catch { body.Image = info.Image }
+    if (body.Hostname === info.Id.slice(0, 12)) delete body.Hostname // that default hostname is the old container's id
+    // anonymous volumes live only in Mounts: bind them explicitly so the new container keeps the data
+    const covered = new Set([...(hc.Binds || []).map((b) => b.split(':')[1]), ...(hc.Mounts || []).map((m) => m.Target), ...Object.keys(hc.Tmpfs || {})])
+    for (const m of info.Mounts || []) if (m.Type === 'volume' && m.Name && !covered.has(m.Destination)) (body.HostConfig.Binds ||= []).push(`${m.Name}:${m.Destination}${m.RW === false ? ':ro' : ''}`)
+    const nets = info.NetworkSettings?.Networks || {}, ep = (n) => ({ Aliases: (n.Aliases || []).filter((a) => a !== info.Id.slice(0, 12)), IPAMConfig: n.IPAMConfig || undefined, Links: n.Links || undefined })
+    const shared = /^(host|none|container:)/.test(hc.NetworkMode || '')
+    const first = hc.NetworkMode in nets ? hc.NetworkMode : Object.keys(nets)[0]
+    if (!shared && first) body.NetworkingConfig = { EndpointsConfig: { [first]: ep(nets[first]) } }
+    const tmp = `${name}-dockdesk-old-${crypto.randomBytes(3).toString('hex')}`
+    if (wasRunning) await dk('POST', `/containers/${info.Id}/stop`)
+    await dk('POST', `/containers/${info.Id}/rename?name=${enc(tmp)}`)
+    let created
+    try {
+      created = await dk('POST', `/containers/create?name=${enc(name)}`, body)
+      if (!shared) for (const n of Object.keys(nets)) if (n !== first) await dk('POST', `/networks/${seg(n)}/connect`, { Container: created.Id, EndpointConfig: ep(nets[n]) })
+      if (wasRunning) await dk('POST', `/containers/${created.Id}/start`)
+    } catch (e) {
+      if (created) await dk('DELETE', `/containers/${created.Id}?force=true`).catch(() => {})
+      await dk('POST', `/containers/${info.Id}/rename?name=${enc(name)}`).catch(() => {})
+      if (wasRunning) await dk('POST', `/containers/${info.Id}/start`).catch(() => {})
+      throw new Error(`Could not recreate the container, the original was put back: ${e.message}`)
+    }
+    try { await dk('DELETE', `/containers/${info.Id}?force=true`) } catch (e) { throw new Error(`The container was recreated without the limit, but the old copy "${tmp}" could not be removed: ${e.message}`) }
+    return { id: created.Id }
   },
   'daemon.start': () => engineCtl('start'),
   'daemon.stop': () => engineCtl('stop'),
@@ -835,7 +1011,11 @@ server.listen(PORT, '127.0.0.1', () => {
   // so only print it when a human is driving this from a terminal, or in headless mode.
   if (process.env.DOCKDESK_NO_OPEN || process.stdout.isTTY) console.log(url)
   if (process.env.DOCKDESK_NO_OPEN) return
-  openApp(url)
+  // Restarted by the old copy (see app.relaunch): wait for it to exit first, otherwise the browser hands this window to the old browser process and returns at once
+  const old = Number(process.env.DOCKDESK_WAIT_PID) || 0
+  const gone = (pid) => { try { process.kill(pid, 0); return false } catch (e) { return e.code !== 'EPERM' } }
+  const wait = async () => { for (let i = 0; old && i < 50 && !gone(old); i++) await new Promise((r) => setTimeout(r, 200)); if (old) await new Promise((r) => setTimeout(r, 500)) }
+  wait().then(() => openApp(url))
 })
 
 // The browser is pointed at a private (0600) file in a private (0700) directory. That page just redirects
@@ -854,13 +1034,14 @@ function makeLaunchFile(url) {
 const dropLaunchFile = () => { if (launchFile) { try { fs.unlinkSync(launchFile) } catch {} launchFile = null } }
 process.on('exit', dropLaunchFile)
 
+let appWindow = null
 function openApp(url) {
   const target = 'file://' + makeLaunchFile(url)
   const browsers = ['chromium', 'chromium-browser', 'google-chrome', 'brave-browser', 'microsoft-edge']
   const profile = path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache'), 'dockdesk', 'profile')
   const tryNext = (i) => {
     if (i >= browsers.length) return execFile('xdg-open', [target], () => {})
-    const child = execFile(browsers[i], [`--app=${target}`, '--class=DockDesk', '--no-first-run', `--user-data-dir=${profile}`], () => {})
+    const child = appWindow = execFile(browsers[i], [`--app=${target}`, '--class=DockDesk', '--no-first-run', `--user-data-dir=${profile}`], () => {})
     child.on('error', () => tryNext(i + 1))
     // When the app window closes, shut the server down so nothing lingers in the background.
     child.on('exit', (code) => { if (code === 0 || code === null) process.exit(0) })

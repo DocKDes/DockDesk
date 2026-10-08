@@ -201,6 +201,14 @@ describe('a missing Compose plugin is explained, not shown as a raw error', () =
   })
   after(() => { srv?.stop(); J.cleanup() })
   it('reports compose as absent in the engine diagnostics', async () => assert.equal((await srv.call('engine.diag')).compose, null))
+  it('names the install command for this distro in the diagnostics and the error', async () => {
+    const d = await srv.call('engine.diag')
+    if (d.composeHint) {
+      assert.match(d.composeHint.cmd, /^sudo (apt install|dnf install|pacman -S|zypper install|apk add) \S*compose\S*$/)
+      await assert.rejects(srv.call('compose.validate', 'services:\n  a:\n    image: x\n'), (e) => e.message.includes(d.composeHint.cmd) && e.message.includes(d.composeHint.distro))
+    } else assert.equal(d.composeHint, null)
+    assert.equal(typeof d.groupPending, 'boolean')
+  })
   it('tells the user how to install it when validating or running a compose file', async () => {
     await assert.rejects(srv.call('compose.validate', 'services:\n  a:\n    image: x\n'), /Docker Compose v2 is not installed.*docker-compose/s)
     await assert.rejects(srv.call('compose.action', 'proj', '', '', 'up'), /Docker Compose v2 is not installed/)

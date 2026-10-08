@@ -102,17 +102,17 @@ About 80 tests: access control and the launch-token handling, input validation, 
 ## Troubleshooting
 
 - **"No permission to use Docker"**: add yourself with `sudo usermod -aG docker $USER`, then log out and back in. Settings shows whether your *current session* has the group yet.
-- **Changed groups but `id` doesn't show it**: group membership is fixed at login. Use `newgrp docker` or log in again. `getent group docker` shows the saved state.
+- **Changed groups but `id` doesn't show it**: group membership is fixed at login. DockDesk notices this and offers **Restart with Docker access**, which relaunches it through `sg docker` (no logout needed). Elsewhere, use `newgrp docker` or log in again. `getent group docker` shows the saved state.
 - **Stop Docker asks for a password**: expected; install the optional rule from Settings to skip it.
 - **Docker Hub search or pulls are slow**: the first registry round trip can take several seconds; it is the network, not the app.
-- **Memory/CPU limits can't be removed**: Docker's update API can change them but not clear them. Recreate the container to go back to unlimited.
+- **Removing a memory/CPU limit**: Docker's update API can change a limit but not clear it, so Settings → *Remove memory/CPU limit* recreates the container with the same settings, volumes (including anonymous ones) and networks, and puts the original back if anything fails. Files changed inside the container's own filesystem are lost, and Compose-managed containers are refused (edit the compose file instead).
 
-- **Compose features say "Docker Compose v2 is not installed"**: the plugin is a separate package whose name differs by distro: `docker-compose-v2` (Ubuntu), `docker-compose` (Debian 13, Kali), `docker-compose-plugin` (Docker's own repository). Debian 12's `docker-compose` is the old v1 and does not work. Settings → Engine shows whether it was found.
+- **Compose features say "Docker Compose v2 is not installed"**: the message and Settings → Engine show the exact install command for your distro (read from `/etc/os-release`). The plugin is a separate package whose name differs by distro: `docker-compose-v2` (Ubuntu), `docker-compose` (Debian 13, Kali), `docker-compose-plugin` (Docker's own repository). Debian 12's `docker-compose` is the old v1 and does not work. Settings → Engine shows whether it was found.
 - **Ubuntu's Chromium is a snap**: `chromium-browser` there is a stub for the snap, whose confinement can stop the app window from reading its private launch file. Install Google Chrome or Chromium from another source if the window doesn't open (not yet tested on Ubuntu).
 
 ## Known limits
 
-Container file browsing lists folders by running `ls` inside the container, so it needs a running container that has `ls`; downloads and uploads work on any container, including stopped ones and minimal images. Uploads are limited to 512 MB per file.
+Container file browsing runs `ls` inside a running container. For stopped containers and images with no `ls` (scratch, distroless) it lists from the filesystem archive instead; that works everywhere, but tar has no "children only" query, so a huge folder is scanned up to a limit and the list can be marked incomplete. Uploads are limited to 512 MB per file.
 
 Not implemented: Kubernetes, Swarm, Docker extensions, dev environments, vulnerability scanning, remote engines,
 a tray icon (needs a native shell such as Tauri). At most 3 terminal tabs, because browsers allow only 6

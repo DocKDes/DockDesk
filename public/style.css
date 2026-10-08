@@ -371,3 +371,11 @@ kbd,.kbd{font:11px ui-monospace,monospace;border:1px solid var(--line);border-bo
 .paltitle{color:var(--fg);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .palsub{font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .palfoot{padding:7px 14px;border-top:1px solid var(--line);background:var(--panel);font-size:12px}
+
+.limits{display:flex;flex-direction:column;gap:12px;margin-top:6px;padding-top:16px;border-top:1px solid var(--line)}
+.limits .row{display:flex;gap:10px;flex-wrap:wrap}
+.cgo{display:flex;flex-direction:column;gap:2px;align-items:flex-start;text-align:left;background:none;border:0;padding:4px 6px;margin:-4px -6px;border-radius:6px;color:inherit;font:inherit;cursor:pointer}
+.cgo .nm{display:flex;align-items:center;gap:4px}
+.cgo .ic{opacity:0;transition:.12s}
+.cgo:hover .nm,.cgo:focus-visible .nm{color:var(--acc)}
+.cgo:hover .ic,.cgo:focus-visible .ic{opacity:1}
