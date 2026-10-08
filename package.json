@@ -1,6 +1,6 @@
 {
   "name": "dockdesk",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "A lightweight Docker Desktop alternative for Linux",
   "author": "Panem Yaswanth Reddy <panemyaswanthreddy@gmail.com>",
   "license": "MIT",
@@ -33,6 +33,7 @@
   "files": [
     "server.js",
     "pty-shell.py",
+    "tray.py",
     "dockdesk-polkit.rules",
     "public",
     "bin",

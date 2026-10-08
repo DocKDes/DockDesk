@@ -118,6 +118,13 @@ describe('input validation (refused before anything privileged runs)', () => {
     await rejects('network.create', ['ok-name', 'not-a-cidr'], /Subnet/)
     await rejects('image.tag', ['x', 'Bad Name', '1'], /lowercase/)
     await rejects('image.tag', ['x', 'good/name', 'bad tag'], /Invalid tag/)
+    await rejects('image.scan', ['--output=/etc/x; id'], /Invalid image reference/)
+    await rejects('image.scan', ['-flag'], /Invalid image reference/)
+    await rejects('container.write', ['../x', '/etc/hosts', 'x'], /Invalid container/)
+    await rejects('compose.service', ['ok', '/tmp', '/etc/hosts', 'web', 'restart'], /not one DockDesk may use/)
+    await rejects('compose.service', ['ok', '/tmp', '', '--rm', 'restart'], /Invalid service/)
+    await rejects('compose.env.write', ['/etc/hosts', 'A=1'], /not one DockDesk may use/)
+    await rejects('compose.graph', ['/etc/hosts'], /not one DockDesk may use/)
   })
   it('open.url only ever opens local http addresses', async () => {
     for (const u of ['http://evil.com/x', 'https://localhost:3000', 'javascript:alert(1)', 'file:///etc/passwd', 'http://localhost:3000/a b', 'http://localhost:99999999999', 'http://localhost.evil.com:80', 'http://127.0.0.1@evil.com:80/'])

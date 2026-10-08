@@ -1,3 +1,4 @@
+import { TR, LANGS } from './i18n.js'
 const TOKEN = new URLSearchParams(location.search).get('t') || sessionStorage.getItem('t') || ''
 sessionStorage.setItem('t', TOKEN)
 const START = location.hash.slice(1)
@@ -33,6 +34,26 @@ async function copyText(text) {
     const ok = document.execCommand('copy'); t.remove(); return ok
   } catch { return false }
 }
+
+// Shell-quote one word for a command we hand to the user.
+const shq = (x) => (/^[\w@%+=:,./-]+$/.test(String(x)) ? String(x) : `'${String(x).replace(/'/g, `'\\''`)}'`)
+// "Copy as command" button for a dialog: puts the equivalent docker command on the clipboard.
+function cliButton(root, getCmd, { after = null } = {}) {
+  const b = document.createElement('button')
+  b.type = 'button'; b.className = 'tb cli'; b.title = 'Copy the equivalent docker command'
+  b.innerHTML = `${ic('terminal', 15)}<span>Copy as command</span>`
+  b.onclick = async () => {
+    let c; try { c = getCmd() } catch (e) { return toast(e.message, true) }
+    if (!c) return
+    const ok = await copyText(c)
+    toast(ok ? 'Copied: ' + (c.length > 70 ? c.slice(0, 67) + '…' : c) : 'Could not copy', !ok)
+  }
+  if (after) after.insertAdjacentElement('afterend', b)
+  else { const row = $('.row', root); row.prepend(b); b.insertAdjacentHTML('afterend', '<span class="sp"></span>') }
+  return b
+}
+// A published-port link with a small copy button next to it.
+const portLink = (port, label) => `<a href="#" data-call='${esc(call('open.url', 'http://localhost:' + port))}' class="port">${label}</a><a href="#" class="pcopy" title="Copy http://localhost:${port}" data-call='${esc(call('copy', 'http://localhost:' + port))}'>${ic('copy', 12)}</a>`
 
 async function api(method, ...args) {
   const r = await fetch('/api/' + method, { method: 'POST', headers: { 'X-Token': TOKEN }, body: JSON.stringify(args) })
@@ -115,9 +136,13 @@ const tbtn = (icon, label, callJson, cls = '') =>
 const call = (...a) => JSON.stringify(a)
 
 // ---------- engine / resource state (feeds sidebar pill, footer, containers header) ----------
-const SETTINGS_DEFAULTS = { refresh: 3, stats: true, notify: false }
+const SETTINGS_DEFAULTS = { refresh: 3, stats: true, notify: false, alertCpu: 0, alertMem: 0, lang: 'auto', autoUpdate: false } // alertCpu: CPU % (0 = off); alertMem: % of the container's memory limit (0 = off)
 const settings = (() => { try { return { ...SETTINGS_DEFAULTS, ...JSON.parse(localStorage.getItem('settings') || '{}') } } catch { return { ...SETTINGS_DEFAULTS } } })()
+// Translation: the English text is the key; anything without a translation stays English. {n}-style placeholders are filled from vars.
+const langCode = () => { const l = settings.lang === 'auto' ? (navigator.language || 'en').slice(0, 2).toLowerCase() : settings.lang; return TR[l] ? l : 'en' }
+const tr = (text, vars) => { let r = TR[langCode()]?.[text] ?? text; if (vars) for (const [k, v] of Object.entries(vars)) r = r.replaceAll(`{${k}}`, v); return r }
 const saveSettings = () => { try { localStorage.setItem('settings', JSON.stringify(settings)) } catch {} }
+let updateAvail = null // { latest, current, install } when a newer version exists
 const engine = { up: true, version: '', ncpu: 0, memTotal: 0, disk: 0 }
 let stats = {} // container id -> { cpu, memUsed, ... }
 const hist = { cpu: [], mem: [] } // last ~5 minutes of totals (one sample per 5 s), for the Overview sparklines
@@ -135,11 +160,41 @@ async function refreshStats() {
   if (document.hidden || !engine.up || !settings.stats) return
   try {
     stats = await api('stats.all')
+    checkAlerts().catch(() => {})
     const t = totals()
     hist.cpu.push(t.cpu); hist.mem.push(t.mem)
     if (hist.cpu.length > 60) { hist.cpu.shift(); hist.mem.shift() }
     applyStats()
   } catch {}
+}
+// Resource alerts: a container above the CPU or memory threshold for 3 samples in a row (about 15 s) raises one
+// notification, and is re-armed once it drops back under. Memory is a share of the container's own limit,
+// or of the host's memory when it has none.
+const breach = new Map() // "id|cpu" or "id|mem" -> { n: consecutive samples over, fired }
+async function checkAlerts() {
+  if (!settings.alertCpu && !settings.alertMem) return breach.clear()
+  let names = null // container names are looked up only when an alert actually fires
+  const seen = new Set()
+  for (const [id, s] of Object.entries(stats)) {
+    for (const [kind, over, text] of [
+      ['cpu', settings.alertCpu > 0 && s.cpu >= settings.alertCpu, `CPU at ${s.cpu.toFixed(0)}% (limit ${settings.alertCpu}%)`],
+      ['mem', settings.alertMem > 0 && s.memLimit > 0 && (s.memUsed / s.memLimit) * 100 >= settings.alertMem, `memory at ${((s.memUsed / s.memLimit) * 100).toFixed(0)}% of ${fmt(s.memLimit)} (limit ${settings.alertMem}%)`]
+    ]) {
+      const key = id + '|' + kind; seen.add(key)
+      const b = breach.get(key) || { n: 0, fired: false }
+      b.n = over ? b.n + 1 : 0
+      if (!over) b.fired = false
+      if (b.n >= 3 && !b.fired) {
+        b.fired = true
+        names ||= new Map((await api('containers.list').catch(() => [])).map((c) => [c.Id, cname(c)]))
+        const name = names.get(id) || id.slice(0, 12), msg = `${name}: ${text}`
+        if ('Notification' in window && Notification.permission === 'granted') new Notification('High resource usage', { body: msg })
+        toast(msg, true)
+      }
+      breach.set(key, b)
+    }
+  }
+  for (const k of breach.keys()) if (!seen.has(k)) breach.delete(k)
 }
 const totals = () => Object.values(stats).reduce((a, s) => ({ cpu: a.cpu + s.cpu, mem: a.mem + s.memUsed }), { cpu: 0, mem: 0 })
 
@@ -199,9 +254,9 @@ let timer, gen = 0, lastHtml = '', lastTickAt = 0
 function nav() {
   $('#nav').innerHTML =
     '<h1><img src="icon.png" width="22" height="22" alt="">DockDesk</h1>' +
-    `<button class="palbtn" data-call='["palette"]' title="Search everything (Ctrl K or /)">${ic('search', 15)}<span>Search…</span><kbd>Ctrl K</kbd></button>` +
-    Object.entries(PAGES).map(([k, [l, i]]) => `<a data-p="${k}" class="${k === current ? 'on' : ''}">${ic(i, 18)}<span>${l}</span></a>`).join('') +
-    `<div class="engine" data-call='["engine"]' title="${engine.up ? 'Click to stop the Docker engine' : 'Click to start the Docker engine'}"><span class="dot ${engine.up ? 'up' : 'down'}"></span>${engine.up ? 'Engine running' : 'Engine stopped'}</div>`
+    `<button class="palbtn" data-call='["palette"]' title="Search everything (Ctrl K or /)">${ic('search', 15)}<span>${tr('Search…')}</span><kbd>Ctrl K</kbd></button>` +
+    Object.entries(PAGES).map(([k, [l, i]]) => `<a data-p="${k}" class="${k === current ? 'on' : ''}">${ic(i, 18)}<span>${tr(l)}</span></a>`).join('') +
+    `<div class="engine" data-call='["engine"]' title="${tr(engine.up ? 'Click to stop the Docker engine' : 'Click to start the Docker engine')}"><span class="dot ${engine.up ? 'up' : 'down'}"></span>${tr(engine.up ? 'Engine running' : 'Engine stopped')}</div>`
 }
 $('#nav').onclick = (e) => { const p = e.target.closest('[data-p]')?.dataset.p; if (p) go(p) }
 
@@ -211,8 +266,10 @@ function renderStatus() {
   $('#status').innerHTML = `
     <span>RAM ${fmt(t.mem)}</span><span>CPU ${t.cpu.toFixed(2)}%</span><span>Disk ${fmt(engine.disk)} used</span>
     <span class="sp"></span>
-    <button data-call='["dock"]' class="${dockOpen ? 'on' : ''}">${ic('terminal', 14)}Terminal</button>
-    <button data-call='["theme"]' title="Switch theme">${ic(theme() === 'light' ? 'moon' : 'sun', 14)}</button>
+    ${updateAvail ? `<button data-call='["goto","settings"]' class="upd" title="${esc(tr('A newer version is available. Open Settings.'))}">${ic('arrowup', 14)}${esc(tr('Update available'))} v${esc(updateAvail.latest)}</button>` : ''}
+    <button data-call='["dock"]' class="${dockOpen ? 'on' : ''}">${ic('terminal', 14)}${tr('Terminal')}</button>
+    <button data-call='["shortcuts"]' title="${esc(tr('Keyboard shortcuts'))} (?)"><b>?</b></button>
+    <button data-call='["theme"]' title="${esc(tr('Switch theme'))}">${ic(theme() === 'light' ? 'moon' : 'sun', 14)}</button>
     ${engine.version ? `<span>v${esc(engine.version)}</span>` : ''}`
 }
 
@@ -295,7 +352,7 @@ document.addEventListener('click', async (e) => {
         try { await navigator.clipboard.writeText(text) } catch { return toast('Could not copy. Run: sudo cp dockdesk-polkit.rules /etc/polkit-1/rules.d/50-dockdesk.rules', true) }
         return toast('Copied. Paste it into a terminal to install the rule.')
       }
-      case 'resetsettings': Object.assign(settings, SETTINGS_DEFAULTS); saveSettings(); applyTheme('auto'); go(current); return toast('Settings reset')
+      case 'resetsettings': Object.assign(settings, SETTINGS_DEFAULTS); saveSettings(); applyTheme('auto'); nav(); renderStatus(); go(current); return toast(tr('Settings reset'))
       case 'tagimg': return tagImage(args[0])
       case 'pushimg': return pushImage(args[0])
       case 'reglogin': return registryLogin()
@@ -315,11 +372,26 @@ document.addEventListener('click', async (e) => {
       case 'cmenu': return showComposeMenu(b, args[0])
       case 'newproject': return composeEditor({})
       case 'editproject': return editProject(args[0])
+      case 'cleanall':
+        if (!confirm('Remove all stopped containers, unused images, unused volumes (their data is lost), unused networks and the build cache?')) return
+        return act('', async () => { const r = await api('system.prune'); toast(`Cleaned up. Reclaimed ${fmt(r.reclaimed)}.`) }, window.refresh)
+      case 'shortcuts': return openShortcuts()
+      case 'checkupdate': return checkForUpdate()
+      case 'openrelease': return act('', () => api('open.release'))
+      case 'exportsettings': return exportSettings()
+      case 'importsettings': return $('#importfile')?.click()
+      case 'projectlogs': return projectLogs(args[0])
+      case 'imgupdates': return checkImageUpdates()
+      case 'cmpimg': return compareImages(args[0])
+      case 'composeprofiles': return composeProfiles(args[0])
+      case 'composeenv': return composeEnv(args[0])
+      case 'composegraph': return composeGraph(args[0])
+      case 'svcscale': return scaleService(args[0], args[1], args[2])
       case 'palette': return openPalette()
       case 'cexpall': visibleProjects().forEach((p) => (args[0] ? cexp.add(p.name) : cexp.delete(p.name))); $('#cprows').innerHTML = composeRows(); return applyStats()
       case 'cexp': cexp.has(args[0]) ? cexp.delete(args[0]) : cexp.add(args[0]); return window.refresh?.()
       case 'imenu': return showImageMenu(b, args[0])
-      case 'inspectimg': return openImageDetail(args[0], args[1])
+      case 'inspectimg': return openImageDetail(args[0], args[1], args[2])
       case 'exportimg': return exportImage(args[0])
       case 'importimg': return importImage()
       case 'ibulkdel': return bulkDeleteImages()
@@ -375,7 +447,7 @@ async function labsPage() {
   const [cs, imgs] = await Promise.all([api('containers.list'), api('images.list')])
   const have = (img) => imgs.some((i) => (i.RepoTags || []).some((t) => t === img || t === img + ':latest'))
   cList = cs
-  return `<div class="head"><h2>${ic('flask', 22)}Labs</h2></div>
+  return `<div class="head"><h2>${ic('flask', 22)}${tr('Labs')}</h2></div>
     <div class="note">${ic('info', 16)}<div><b>These apps are intentionally vulnerable.</b> DockDesk publishes their ports on <span class="mono">127.0.0.1</span> only, so nothing is reachable from your network. Never run them on an exposed interface.</div></div>
     <div class="labgrid">${LABS.map((l) => {
       const c = labOf(cs, l.id), up = c?.State === 'running', port = c && pubPorts(c)[0]
@@ -502,7 +574,7 @@ async function activityPage() {
   imgs.forEach((i) => (i.RepoTags || []).forEach((t) => imgByName.set(t, i.Id)))
   actCtx = { cids: new Set(cs.map((c) => c.Id)), imgIds: new Set(imgs.map((i) => i.Id)), imgByName }
   const problems = activity.filter(isProblem).length
-  return `<div class="head"><h2>${ic('activity', 22)}Activity<span class="count">${activity.length}</span></h2>
+  return `<div class="head"><h2>${ic('activity', 22)}${tr('Activity')}<span class="count">${activity.length}</span></h2>
     <div class="usage"><div><div class="k">Problems</div><div class="v"><b style="color:${problems ? 'var(--bad)' : 'var(--ok)'}">${problems}</b></div><div class="s">crashes and failed health checks</div></div></div></div>
     <div class="tools">
       <label class="search">${ic('search', 15)}<input type="text" id="aq" placeholder="Search events…" value="${esc(actFilter.q)}"></label>
@@ -549,6 +621,7 @@ async function openPalette() {
     ['download', 'Pull an image', () => pullImage()], ['hammer', 'Build an image from a Dockerfile', () => buildImage()], ['upload', 'Import an image from a .tar', () => importImage()],
     ['plus', 'New compose project', () => composeEditor({})], ['plus', 'New volume', () => newVolume()], ['plus', 'New network', () => newNetwork()],
     ['terminal', 'Open a host terminal', () => openTerm('shell')], [theme() === 'light' ? 'moon' : 'sun', 'Switch theme', () => toggleTheme()],
+    ['terminal', 'Keyboard shortcuts', () => openShortcuts()], ['arrowup', 'Check for DockDesk updates', () => checkForUpdate()],
     ['power', engine.up ? 'Stop the Docker engine' : 'Start the Docker engine', () => document.querySelector('.engine')?.click()]
   ].map(([icon, title, fn]) => ({ g: 'Actions', icon, title, sub: '', run: run(fn) }))
   const labs = LABS.map((l) => ({ g: 'Labs', icon: 'flask', title: 'Start lab: ' + l.name, sub: l.image, run: run(() => startLab(l.id)) }))
@@ -610,23 +683,119 @@ document.addEventListener('keydown', (e) => {
   if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'k') { e.preventDefault(); openPalette() }
   else if (e.key === '/' && !typing && !e.ctrlKey && !e.metaKey && !e.altKey && !pal) { e.preventDefault(); openPalette() }
   else if (e.key === 'Escape' && pal) closePalette()
+  else if (e.key === '?' && !typing && !pal?.isConnected && !e.ctrlKey && !e.metaKey && !e.altKey) { e.preventDefault(); if ($('.modal.keys')) closeModal(); else if (!$('.modal')) openShortcuts() }
+  else if (!typing && !pal?.isConnected && !$('.modal') && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    if (gPending) { const to = G_KEYS[e.key]; gPending = false; clearTimeout(gTimer); if (to) { e.preventDefault(); go(to) } }
+    else if (e.key === 'g') { gPending = true; clearTimeout(gTimer); gTimer = setTimeout(() => (gPending = false), 1200) }
+    else if (e.key === 't') toggleDock()
+    else if (e.key === 'r') window.refresh?.()
+  }
 })
+// ---------- Keyboard shortcuts cheat sheet ----------
+let gPending = false, gTimer
+const G_KEYS = { o: 'dashboard', m: 'compose', c: 'containers', i: 'images', v: 'volumes', n: 'networks', l: 'labs', a: 'activity', s: 'settings' }
+function openShortcuts() {
+  closeModal()
+  const k = (...keys) => keys.map((x) => `<kbd>${esc(x)}</kbd>`).join(' ')
+  const group = (title, rows) => `<div class="dsub">${esc(tr(title))}</div><table class="keytbl"><tbody>${rows.map(([keys, d]) => `<tr><td class="nw">${keys}</td><td>${esc(tr(d))}</td></tr>`).join('')}</tbody></table>`
+  const m = document.createElement('div')
+  m.className = 'modal keys'
+  m.innerHTML = `<div class="box wide"><h3>${ic('terminal', 18)}${esc(tr('Keyboard shortcuts'))}</h3>
+    <div class="keys-body">
+    ${group('Anywhere', [[`${k('Ctrl', 'K')} ${esc(tr('or'))} ${k('/')}`, 'Open search and commands'], [k('?'), 'Show this cheat sheet'], [k('Esc'), 'Close the open dialog, drawer or menu'], [k('t'), 'Show or hide the terminal'], [k('r'), 'Refresh the current page']])}
+    ${group('Go to a page (press g, then…)', [[k('g', 'o'), 'Overview'], [k('g', 'm'), 'Compose'], [k('g', 'c'), 'Containers'], [k('g', 'i'), 'Images'], [k('g', 'v'), 'Volumes'], [k('g', 'n'), 'Networks'], [k('g', 'l'), 'Labs'], [k('g', 'a'), 'Activity'], [k('g', 's'), 'Settings']])}
+    ${group('In search', [[`${k('↑')} ${k('↓')}`, 'Move through the results'], [k('Enter'), 'Run the selected result']])}
+    ${group('In the log viewer', [[k('Enter'), 'Next match'], [`${k('Shift')} ${k('Enter')}`, 'Previous match']])}
+    </div>
+    <div class="row"><button type="button" class="tb pri" data-x>${esc(tr('Close'))}</button></div></div>`
+  document.body.append(m)
+  m.onclick = (e) => { if (e.target === m || e.target.closest('[data-x]')) closeModal() }
+}
 
 // ---------- Settings ----------
+// ---------- Updates, backup of settings ----------
+const UPDATE_HOW = { npm: 'npm install -g dockdesk@latest', deb: null, script: null, source: 'git pull' }
+async function checkForUpdate({ silent = false } = {}) {
+  try {
+    const r = await api('update.check')
+    try { localStorage.setItem('lastUpdateCheck', String(Date.now())) } catch {}
+    updateAvail = r.newer ? r : null
+    renderStatus()
+    if (current === 'settings') window.refresh?.()
+    if (r.newer) toast(tr('DockDesk {v} is available', { v: r.latest }))
+    else if (!silent) toast(tr('You have the latest version ({v})', { v: r.current }))
+    return r
+  } catch (e) { if (!silent) toast(e.message, true) }
+}
+function updateRow(app) {
+  const how = (r) => r.install === 'deb' ? `sudo apt install ./dockdesk_${r.latest}_all.deb` : UPDATE_HOW[r.install]
+  const info = updateAvail
+    ? `<div class="pending">${esc(tr('DockDesk {v} is available', { v: updateAvail.latest }))}.</div>${how(updateAvail) ? `<div class="meta">${esc(tr('Update with'))}: <span class="mono">${esc(how(updateAvail))}</span> ${ibtn('copy', tr('Copy command'), call('copy', how(updateAvail)))}</div>` : ''}<div class="meta">${esc(tr(updateAvail.install === 'script' ? 'Download the new .tar.gz from the releases page, unpack it and run ./install.sh' : updateAvail.install === 'deb' ? 'Download the new .deb from the releases page first.' : ''))}</div>`
+    : ''
+  return { app, info }
+}
+const SETTING_KEYS = { refresh: 'number', stats: 'boolean', notify: 'boolean', alertCpu: 'number', alertMem: 'number', lang: 'string', autoUpdate: 'boolean' }
+async function exportSettings() {
+  let theme = 'auto'; try { theme = localStorage.getItem('theme') || 'auto' } catch {}
+  let tray = false; try { tray = (await api('tray.status')).enabled } catch {}
+  const doc = { app: 'dockdesk', format: 1, exported: new Date().toISOString(), settings: { ...settings }, theme, runPresets: loadPresets(), tray }
+  const a = document.createElement('a')
+  a.href = URL.createObjectURL(new Blob([JSON.stringify(doc, null, 2)], { type: 'application/json' }))
+  a.download = 'dockdesk-settings.json'
+  document.body.append(a); a.click(); a.remove()
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000)
+  toast(tr('Settings exported'))
+}
+async function importSettings(file) {
+  try {
+    if (file.size > 1e6) throw new Error(tr('That file is too large to be a DockDesk settings file.'))
+    let doc; try { doc = JSON.parse(await file.text()) } catch { throw new Error(tr('That is not a DockDesk settings file.')) }
+    if (!doc || doc.app !== 'dockdesk' || doc.format !== 1 || typeof doc.settings !== 'object') throw new Error(tr('That is not a DockDesk settings file.'))
+    const next = {}
+    for (const [k, type] of Object.entries(SETTING_KEYS)) if (typeof doc.settings[k] === type) next[k] = doc.settings[k]
+    if (next.lang && next.lang !== 'auto' && !TR[next.lang]) delete next.lang
+    for (const k of ['refresh', 'alertCpu', 'alertMem']) if (k in next && !(Number.isFinite(next[k]) && next[k] >= 0 && next[k] <= 10000)) delete next[k]
+    if ('refresh' in next && next.refresh < 1) delete next.refresh
+    const presets = {}
+    if (doc.runPresets && typeof doc.runPresets === 'object') for (const [n, v] of Object.entries(doc.runPresets).slice(0, 100)) if (v && typeof v.image === 'string' && Array.isArray(v.ports) && Array.isArray(v.volumes) && Array.isArray(v.env)) presets[String(n).slice(0, 60)] = v
+    Object.assign(settings, next); saveSettings()
+    if (Object.keys(presets).length) savePresets({ ...loadPresets(), ...presets })
+    if (['auto', 'light', 'dark'].includes(doc.theme)) applyTheme(doc.theme)
+    if (typeof doc.tray === 'boolean') { try { await api('tray.set', doc.tray) } catch (e) { if (doc.tray) toast(e.message, true) } }
+    toast(tr('Settings imported: {n} settings, {p} presets', { n: Object.keys(next).length, p: Object.keys(presets).length }))
+    nav(); renderStatus(); go(current)
+  } catch (e) { toast(e.message, true) }
+}
+document.addEventListener('change', (e) => { if (e.target.id === 'importfile') { const f = e.target.files[0]; e.target.value = ''; if (f) importSettings(f) } })
+
 async function settingsPage() {
-  const [d, info, grp, reg] = await Promise.all([api('engine.diag'), api('info'), api('group.list'), api('registry.status')])
+  const [d, info, grp, reg, app, tray] = await Promise.all([api('engine.diag'), api('info'), api('group.list'), api('registry.status'), api('app.info'), api('tray.status')])
   let themeSel = 'auto'; try { themeSel = localStorage.getItem('theme') || 'auto' } catch {}
   const row = (title, desc, control) => `<div class="srow"><div><div class="nm">${title}</div><div class="meta">${desc}</div></div><div class="sctl">${control}</div></div>`
   const sel = (key, opts, cur) => `<select data-setting="${key}">${opts.map(([v, l]) => `<option value="${v}" ${String(cur) === String(v) ? 'selected' : ''}>${l}</option>`).join('')}</select>`
+  const sw = (key, on, extra = '') => `<label class="switch"><input type="checkbox" data-setting="${key}" ${on ? 'checked' : ''} ${extra}></label>`
   const val = (v) => `<span class="mono">${esc(v)}</span>`
-  return `<div class="head"><h2>${ic('sliders', 22)}Settings</h2></div>
-    <div class="section">General</div><div class="panel">
-      ${row('Theme', 'Follow the system, or force light or dark.', sel('theme', [['auto', 'System'], ['light', 'Light'], ['dark', 'Dark']], themeSel))}
-      ${row('Refresh interval', 'How often the lists update while a page is open.', sel('refresh', [[2, '2 seconds'], [3, '3 seconds'], [5, '5 seconds'], [10, '10 seconds'], [30, '30 seconds']], settings.refresh))}
-      ${row('Crash notifications', 'Show a desktop notification when a container exits with an error or runs out of memory.', `<label class="switch"><input type="checkbox" data-setting="notify" ${settings.notify ? 'checked' : ''}></label>`)}
-      ${row('Live CPU and memory', 'Samples running containers every 5 seconds. Turn it off to use fewer resources.', `<label class="switch"><input type="checkbox" data-setting="stats" ${settings.stats ? 'checked' : ''}></label>`)}
+  const u = updateRow(app)
+  return `<div class="head"><h2>${ic('sliders', 22)}${tr('Settings')}</h2></div>
+    <div class="section">${tr('General')}</div><div class="panel">
+      ${row(tr('Theme'), tr('Follow the system, or force light or dark.'), sel('theme', [['auto', tr('System')], ['light', tr('Light')], ['dark', tr('Dark')]], themeSel))}
+      ${row(tr('Language'), tr('Language of the menus, titles and settings. Everything else stays in English for now.'), sel('lang', [['auto', tr('Automatic')], ...Object.entries(LANGS)], settings.lang))}
+      ${row(tr('Refresh interval'), tr('How often the lists update while a page is open.'), sel('refresh', [2, 3, 5, 10, 30].map((n) => [n, tr('{n} seconds', { n })]), settings.refresh))}
+      ${row(tr('Crash notifications'), tr('Show a desktop notification when a container exits with an error or runs out of memory.'), sw('notify', settings.notify))}
+      ${row(tr('CPU alert'), tr('Notify when a container stays above this CPU usage for about 15 seconds (100% is one full core). Needs live CPU and memory.'), sel('alertCpu', [[0, tr('Off')], [80, '80%'], [100, '100%'], [150, '150%'], [200, '200%'], [400, '400%']], settings.alertCpu))}
+      ${row(tr('Memory alert'), tr('Notify when a container stays above this share of its memory limit for about 15 seconds. Only containers with a limit are checked.'), sel('alertMem', [[0, tr('Off')], [70, '70%'], [80, '80%'], [90, '90%'], [95, '95%']], settings.alertMem))}
+      ${row(tr('Live CPU and memory'), tr('Samples running containers every 5 seconds. Turn it off to use fewer resources.'), sw('stats', settings.stats))}
+      ${row(tr('Keyboard shortcuts'), tr('Press ? anywhere to see them.'), tbtn('terminal', tr('Show'), call('shortcuts')))}
+      ${row(tr('System tray icon'), tray.available ? tr('Keeps DockDesk in the tray when you close the window, with a quick menu to open it and to start or stop Docker.') : `${esc(tr('Not available here: it needs a desktop session, python3-gi and an AppIndicator library.'))}${tray.hint ? ` <span class="mono">${esc(tray.hint)}</span> ${ibtn('copy', tr('Copy command'), call('copy', tray.hint))}` : ''}<br>${esc(tr('On GNOME you also need the AppIndicator extension.'))}`, sw('tray', tray.enabled, tray.available ? '' : 'disabled'))}
     </div>
-    <div class="section">Engine</div><div class="panel">
+    <div class="section">${tr('Updates')}</div><div class="panel">
+      ${row(`DockDesk <span class="mono">v${esc(u.app.version)}</span>`, `${esc(tr('Installed with'))}: ${esc({ npm: 'npm', deb: '.deb', script: 'install.sh', source: tr('source folder') }[u.app.install] || u.app.install)}. ${esc(tr('Checking asks registry.npmjs.org for the newest version and sends nothing else.'))}${u.info}`, `${tbtn('restart', tr('Check for updates'), call('checkupdate'))}${updateAvail ? tbtn('ext', tr('Releases page'), call('openrelease')) : ''}`)}
+      ${row(tr('Check automatically once a day'), tr('Off by default. When on, DockDesk asks the update server about once a day while it runs.'), sw('autoUpdate', settings.autoUpdate))}
+    </div>
+    <div class="section">${tr('Backup')}</div><div class="panel">
+      ${row(tr('Export or import settings'), tr('Saves your settings, theme, language and saved Run presets to a file, or restores them from one (for example on another computer). Registry passwords are never included.'), `${tbtn('download', tr('Export settings'), call('exportsettings'))}${tbtn('upload', tr('Import settings…'), call('importsettings'))}<input type="file" id="importfile" accept=".json,application/json" hidden>`)}
+    </div>
+    <div class="section">${tr('Engine')}</div><div class="panel">
       ${row('Docker Engine', esc(info.OperatingSystem), val('v' + info.ServerVersion))}
       ${row('Storage driver', 'Docker root: ' + esc(info.DockerRootDir), val(info.Driver))}
       ${row('Socket', 'The Unix socket DockDesk talks to.', val(d.socket))}
@@ -636,16 +805,16 @@ async function settingsPage() {
       ${row('Start / stop without a password', 'Starting or stopping the engine asks for your password by default. Install this one-time rule to let docker-group members skip it (scoped to docker.service). Undo: sudo rm /etc/polkit-1/rules.d/50-dockdesk.rules', tbtn('copy', 'Copy setup command', call('copyrule')))}
       ${row('Docker group', 'Members can use Docker without sudo.', d.inDockerGroup ? '<span class="pill running">Member</span>' : '<span class="pill warn">Not a member</span>')}
     </div>
-    <div class="section">Registries</div><div class="panel">
+    <div class="section">${tr('Registries')}</div><div class="panel">
       ${reg.registries.length ? reg.registries.map((r) => row(esc(r), 'Signed in', tbtn('x', 'Sign out', call('reglogout', r)))).join('') : row('Not signed in to any registry', 'Sign in to push images to Docker Hub, GHCR or a private registry.', '')}
       ${row('Sign in', reg.store ? `Credentials are kept by Docker's credential helper (${esc(reg.store)}).` : 'Docker stores credentials in ~/.docker/config.json (readable only by you, but not encrypted). Install a Docker credential helper for stronger protection.', tbtn('plus', 'Sign in…', call('reglogin')))}
     </div>
-    <div class="section">Docker access</div>
+    <div class="section">${tr('Docker access')}</div>
     <div class="note">${ic('info', 16)}<div><b>Docker group members have root-equivalent access to this machine.</b> They can start containers that mount the whole filesystem. Only add people you would give a root shell. Each change asks for an administrator password, and it takes effect the next time that user logs in.</div></div>
     <div class="panel">${grp.exists ? grp.users.map((u) => row(`${esc(u.name)}${u.you ? ' <span class="pill">you</span>' : ''}`, `uid ${u.uid}${u.primary ? ' · docker is this user\'s primary group' : ''}${u.you && u.member !== u.sessionHas ? `<br><span class="pending">${u.member ? 'Added, but your current login session does not have it yet. Log out and back in, or run newgrp docker in a terminal.' : 'Removed, but your current session still has it until you log out and back in.'}</span>` : ''}`,
       `<label class="switch"><input type="checkbox" data-groupuser="${esc(u.name)}" data-you="${u.you ? 1 : 0}" ${u.member ? 'checked' : ''} ${u.primary ? 'disabled' : ''}></label>`)).join('') || row('No regular users found', '', '')
       : row('The docker group does not exist', 'Install Docker first (sudo apt install docker.io).', '')}</div>
-    <div class="tools" style="margin-top:16px">${tbtn('restart', 'Reset settings', call('resetsettings'))}</div>`
+    <div class="tools" style="margin-top:16px">${tbtn('restart', tr('Reset settings'), call('resetsettings'))}</div>`
 }
 document.addEventListener('change', async (e) => {
   const gu = e.target.dataset?.groupuser
@@ -669,6 +838,16 @@ document.addEventListener('change', async (e) => {
       if (!ok) { e.target.checked = false; return toast('Notifications are blocked. Allow them for this app in your browser settings.', true) }
     }
     settings.notify = e.target.checked; saveSettings(); toast('Saved')
+  }
+  else if (k === 'alertCpu' || k === 'alertMem') {
+    settings[k] = Number(e.target.value); saveSettings(); breach.clear(); toast('Saved')
+    if (settings[k] && 'Notification' in window && Notification.permission === 'default') Notification.requestPermission()
+  }
+  else if (k === 'lang') { settings.lang = e.target.value; saveSettings(); document.documentElement.lang = langCode(); nav(); renderStatus(); go(current); toast(tr('Saved')) }
+  else if (k === 'autoUpdate') { settings.autoUpdate = e.target.checked; saveSettings(); toast(tr('Saved')); if (settings.autoUpdate) checkForUpdate({ silent: true }) }
+  else if (k === 'tray') {
+    try { await api('tray.set', e.target.checked); toast(tr(e.target.checked ? 'The tray icon is on. Closing the window now keeps DockDesk running in the tray.' : 'The tray icon is off.')) }
+    catch (err) { e.target.checked = !e.target.checked; toast(err.message, true) }
   }
   else if (k === 'stats') { settings.stats = e.target.checked; saveSettings(); if (!settings.stats) { stats = {}; applyStats() } else refreshStats(); toast('Saved') }
 })
@@ -753,7 +932,7 @@ async function dashboard() {
   const sizeOrNone = (n) => (n > 0 ? fmt(n) : '<span class="meta">nothing to clean</span>')
   const volUnused = (df.Volumes || []).filter((v) => v.UsageData?.RefCount === 0).length
   const stopped = cs.filter((c) => c.State !== 'running').length
-  return `<div class="head"><h2>${ic('dashboard', 22)}Overview</h2>
+  return `<div class="head"><h2>${ic('dashboard', 22)}${tr('Overview')}</h2>
       <div class="hostline"><span class="dot up"></span>Docker ${esc(info.ServerVersion)} · ${esc(info.OperatingSystem)} · ${info.NCPU} CPUs · ${fmt(info.MemTotal)}</div></div>
     <div class="tiles">
       ${tile('containers', 'box', 'Containers', `<b>${info.ContainersRunning}</b> running`, `${info.Containers} total · ${info.ContainersPaused} paused`)}
@@ -772,6 +951,7 @@ async function dashboard() {
           ${clean('Unused images', imgUnused.length + ' of ' + D.images.n + ' not used by any container', sizeOrNone(D.images.rec), call('confirm', 'Remove ALL images that no container uses? They can be pulled again.', 'images.prune', true), 'images', 'unused')}
           ${clean('Stopped containers', stopped + ' stopped', sizeOrNone(D.containers.rec), call('confirm', 'Remove all stopped containers?', 'containers.prune'), 'containers', 'stopped')}
           ${clean('Unused volumes', volUnused + ' of ' + D.volumes.n + ' unused · deleting loses their data', sizeOrNone(D.volumes.rec), call('confirm', 'Remove ALL unused volumes? Their data will be lost.', 'volumes.prune'), 'volumes', 'unused')}
+          ${clean('Build cache', (df.BuildCache || []).filter((c) => !c.InUse).length + ' of ' + D.cache.n + ' entries not in use', sizeOrNone(D.cache.rec), call('confirm', 'Clear the build cache? The next build will be slower.', 'builds.prune'), 'images', 'all')}
           ${clean('Unused networks', 'custom networks no container uses', '<span class="meta">–</span>', call('confirm', 'Remove unused networks?', 'networks.prune'), 'networks', 'unused')}
         </div>
       </div>
@@ -785,6 +965,7 @@ async function dashboard() {
     <div class="tools">
       ${tbtn('download', 'Pull image', '["pull"]')}${tbtn('hammer', 'Build image', call('build'))}${tbtn('plus', 'New volume', call('newvol'))}${tbtn('plus', 'New network', call('newnet'))}
       ${tbtn('terminal', 'Open terminal', call('dock'))}${tbtn('flask', 'Browse labs', call('goto', 'labs'))}<span class="sp"></span>
+      ${tbtn('broom', 'Clean everything', call('cleanall'), 'dan')}
       ${tbtn('power', 'Stop Docker', call('engine'), 'dan')}
     </div>`
 }
@@ -811,7 +992,7 @@ function containerRows() {
       <td><div class="namecell"><span class="dot ${c.State}" title="${c.State}"></span><span class="nm">${esc(cname(c))}</span></div></td>
       <td class="mono">${c.Id.slice(0, 12)}</td>
       <td class="trunc mono" title="${esc(c.Image)}"><span class="imglink">${esc(c.Image)}</span></td>
-      <td class="mono">${pubPorts(c).map((p) => `<a href="#" data-call='${esc(call('open.url', 'http://localhost:' + p.PublicPort))}' class="port">${p.PublicPort}:${p.PrivatePort}</a>`).join(' ') || '–'}</td>
+      <td class="mono">${pubPorts(c).map((p) => portLink(p.PublicPort, `${p.PublicPort}:${p.PrivatePort}`)).join(' ') || '–'}</td>
       <td class="nw">${rel(c.StartedAt)}</td>
       <td class="num" data-cpu="${c.Id}" data-run="${up ? 1 : 0}">${up ? '–' : '0%'}</td>
       <td><div class="actions">${toggle}${ibtn('more', 'More actions', call('menu', c.Id))}${ibtn('trash', 'Delete', call('confirm', `Delete ${cname(c)}?`, 'container.remove', c.Id, true), 'dan')}</div></td></tr>`
@@ -823,7 +1004,7 @@ async function containers() {
   cList.sort((a, b) => (b.State === 'running') - (a.State === 'running') || Date.parse(b.StartedAt || 0) - Date.parse(a.StartedAt || 0))
   for (const id of [...sel]) if (!cList.some((c) => c.Id === id)) sel.delete(id)
   const running = cList.filter((c) => c.State === 'running').length
-  return `<div class="head"><h2>${ic('box', 22)}Containers<span class="count">${cList.length}</span></h2>
+  return `<div class="head"><h2>${ic('box', 22)}${tr('Containers')}<span class="count">${cList.length}</span></h2>
     <div class="usage">
       <div><div class="k">Container CPU usage</div><div class="v"><b id="u-cpu">–</b> / ${engine.ncpu ? engine.ncpu * 100 : '…'}%</div><div class="s">(${engine.ncpu || '…'} CPUs allocated)</div></div>
       <div><div class="k">Container memory usage</div><div class="v"><b id="u-mem">–</b> / ${fmt(engine.memTotal)}</div><div class="s">${running} running</div></div>
@@ -880,6 +1061,7 @@ function showMenu(btn, id) {
   const item = (icon, label, callJson, cls = '') => `<button class="${cls}" data-call='${esc(callJson)}'>${ic(icon, 15)}${label}</button>`
   m.innerHTML = [
     up && port ? item('ext', `Open localhost:${port.PublicPort}`, call('open.url', `http://localhost:${port.PublicPort}`)) : '',
+    port ? item('copy', `Copy http://localhost:${port.PublicPort}`, call('copy', `http://localhost:${port.PublicPort}`)) : '',
     item('info', 'View details', call('open', id, 'Overview')),
     item('logs', 'View logs', call('open', id, 'Logs')),
     up ? item('terminal', 'Open terminal', call('term', id, cname(c))) : '',
@@ -928,16 +1110,16 @@ function composeRows() {
         <td class="nm">${esc(svcName(c))}</td>
         <td class="mono">${esc(cname(c))}</td>
         <td class="mono trunc" title="${esc(c.Image)}">${esc(c.Image)}</td>
-        <td class="mono">${pubPorts(c).map((x) => `<a href="#" data-call='${esc(call('open.url', 'http://localhost:' + x.PublicPort))}' class="port">${x.PublicPort}:${x.PrivatePort}</a>`).join(' ') || '–'}</td>
+        <td class="mono">${pubPorts(c).map((x) => portLink(x.PublicPort, `${x.PublicPort}:${x.PrivatePort}`)).join(' ') || '–'}</td>
         <td class="nw">${esc(c.Status)}</td>
         <td class="num nw" data-cpu="${c.Id}" data-run="${c.State === 'running' ? 1 : 0}">${c.State === 'running' ? '–' : '0%'}</td>
-        <td><div class="actions">${c.State === 'running' ? ibtn('stop', 'Stop', call('container.action', c.Id, 'stop'), 'stop') : ibtn('play', 'Start', call('container.action', c.Id, c.State === 'paused' ? 'unpause' : 'start'), 'ok')}${ibtn('logs', 'View logs', call('open', c.Id, 'Logs'))}${ibtn('more', 'More actions', call('menu', c.Id))}</div></td></tr>`).join('')}</tbody></table></td></tr>` : ''
+        <td><div class="actions">${c.State === 'running' ? ibtn('stop', 'Stop', call('container.action', c.Id, 'stop'), 'stop') : ibtn('play', 'Start', call('container.action', c.Id, c.State === 'paused' ? 'unpause' : 'start'), 'ok')}${ibtn('logs', 'View logs', call('open', c.Id, 'Logs'))}${ibtn('restart', 'Restart this service', call('compose.service', p.name, p.dir, p.files, svcName(c), 'restart'))}${ibtn('layers', 'Scale this service', call('svcscale', p.name, svcName(c), p.cs.filter((x) => svcName(x) === svcName(c)).length))}${ibtn('more', 'More actions', call('menu', c.Id))}</div></td></tr>`).join('')}</tbody></table></td></tr>` : ''
     return `<tr class="row-click cprow ${open ? 'open' : ''}" data-cp="${esc(p.name)}">
       <td class="cb">${ibtn(open ? 'chevdown' : 'chevright', open ? 'Collapse' : 'Expand', call('cexp', p.name))}</td>
       <td><div class="namecell"><span class="dot ${st === 'stopped' ? 'exited' : st === 'partial' ? 'paused' : 'running'}"></span><div><div class="nm">${esc(p.name)}</div><div class="sub mono" title="${esc(p.dir)}">${esc(p.dir)}</div></div></div></td>
       <td><div class="chips">${chips}</div></td>
       <td><span class="pill ${st === 'running' ? 'running' : st === 'partial' ? 'warn' : ''}">${run} of ${p.cs.length} running</span></td>
-      <td class="mono">${ports.slice(0, 3).map((x) => `<a href="#" data-call='${esc(call('open.url', 'http://localhost:' + x.PublicPort))}' class="port">${x.PublicPort}</a>`).join(' ') || '–'}${ports.length > 3 ? ` <span class="meta">+${ports.length - 3}</span>` : ''}</td>
+      <td class="mono">${ports.slice(0, 3).map((x) => portLink(x.PublicPort, x.PublicPort)).join(' ') || '–'}${ports.length > 3 ? ` <span class="meta">+${ports.length - 3}</span>` : ''}</td>
       <td class="num nw" data-pstat="${p.cs.filter((c) => c.State === 'running').map((c) => c.Id).join(',')}">–</td>
       <td><div class="actions">${toggle}${ibtn('more', 'More actions', call('cmenu', p.name))}${ibtn('trash', 'Down: remove containers', call('confirm', `Remove all containers and networks of “${p.name}”? Volumes are kept.`, 'compose.action', p.name, p.dir, p.files, 'down'), 'dan')}</div></td></tr>${sub}`
   }).join('') || `<tr><td colspan="7"><div class="empty">No matching projects</div></td></tr>`
@@ -957,7 +1139,7 @@ async function compose() {
   const all = Object.values(cProjects)
   const running = all.filter((p) => projState(p) !== 'stopped').length
   const svc = all.reduce((a, p) => a + p.cs.length, 0), svcUp = all.reduce((a, p) => a + p.cs.filter((c) => c.State === 'running').length, 0)
-  return `<div class="head"><h2>${ic('layers', 22)}Compose<span class="count">${all.length}</span></h2>
+  return `<div class="head"><h2>${ic('layers', 22)}${tr('Compose')}<span class="count">${all.length}</span></h2>
     <div class="usage">
       <div><div class="k">Projects running</div><div class="v"><b>${running}</b> / ${all.length}</div><div class="s">${all.length - running} stopped</div></div>
       <div><div class="k">Services running</div><div class="v"><b>${svcUp}</b> / ${svc}</div><div class="s">across all projects</div></div>
@@ -1001,6 +1183,7 @@ function composeEditor({ project = '', file = '', text = '', writable = true } =
   document.body.append(m)
   const ta = $('#ceyaml', m), nameIn = $('#cename', m), stat = $('#cestat', m), out = $('#ceout', m)
   let curFile = file, stopRun = null
+  cliButton(m, () => `docker compose -p ${shq(isNew ? nameIn.value.trim() || 'my-project' : project)} -f ${shq(curFile || 'compose.yaml')} up -d`)
   const say = (html, kind) => { stat.className = 'cestat ' + (kind || ''); stat.innerHTML = html }
   $('#ceclose', m).onclick = () => { stopRun?.(); closeModal() }
   m.onclick = (e) => { if (e.target === m) { stopRun?.(); closeModal() } }
@@ -1060,12 +1243,242 @@ function showComposeMenu(btn, name) {
   const act = (v) => call('compose.action', p.name, p.dir, p.files, v)
   const item = (icon, label, callJson, cls = '') => `<button class="${cls}" data-call='${esc(callJson)}'>${ic(icon, 15)}${label}</button>`
   m.innerHTML = [
-    item('play', 'Start (up -d)', act('up')), item('restart', 'Restart', act('restart')), item('stop', 'Stop', act('stop')),
+    item('play', 'Start (up -d)', act('up')), item('play', 'Start with profiles…', call('composeprofiles', p.name)), item('restart', 'Restart', act('restart')), item('stop', 'Stop', act('stop')),
+    '<hr>', item('download', 'Pull images', act('pull')), item('hammer', 'Build images', act('build')),
     '<hr>', item('down', 'Down (remove containers)', call('confirm', `Remove all containers and networks of “${p.name}”? Volumes are kept.`, 'compose.action', p.name, p.dir, p.files, 'down'), 'dan'),
-    '<hr>', item('logs', 'Edit compose file…', call('editproject', p.name)),
+    '<hr>', item('logs', 'View combined logs', call('projectlogs', p.name)), item('layers', 'Dependency graph', call('composegraph', p.name)), item('logs', 'Environment (.env)…', call('composeenv', p.name)), item('logs', 'Edit compose file…', call('editproject', p.name)),
     p.dir ? item('copy', 'Copy project folder', call('copy', p.dir)) : ''
   ].join('')
   placeMenu(btn)
+}
+// ---------- Image updates and comparison ----------
+const iUpdates = new Map() // image ref -> true (a newer version is in the registry) | false | null (could not tell)
+let iChecking = false
+async function checkImageUpdates() {
+  if (iChecking) return
+  const refs = iList.filter((r) => !r.dangling && !r.ref.startsWith('sha256:')).map((r) => r.ref)
+  if (!refs.length) return toast('No tagged images to check')
+  iChecking = true; toast(`Checking ${refs.length} image${refs.length === 1 ? '' : 's'} against their registries…`)
+  let i = 0
+  const worker = async () => {
+    while (i < refs.length) {
+      const ref = refs[i++]
+      try { iUpdates.set(ref, (await api('image.update.check', ref)).update) } catch { iUpdates.set(ref, null) }
+      if ($('#irows')) $('#irows').innerHTML = imageRows()
+    }
+  }
+  await Promise.all([worker(), worker(), worker(), worker()])
+  iChecking = false
+  const n = [...iUpdates.values()].filter((v) => v === true).length
+  toast(n ? `${n} image${n === 1 ? ' has' : 's have'} an update available` : 'Everything checked is up to date')
+}
+
+// Side-by-side comparison of two images: size, config, environment and layers.
+async function compareImages(a = '') {
+  closeModal()
+  const opts = iList.map((r) => ({ v: r.ref, l: r.dangling ? `${short(r.id)} (untagged)` : r.ref }))
+  if (opts.length < 2) return toast('You need at least two images to compare', true)
+  const m = document.createElement('div')
+  m.className = 'modal'
+  const sel = (id, cur) => `<select id="${id}">${opts.map((o) => `<option value="${esc(o.v)}" ${o.v === cur ? 'selected' : ''}>${esc(o.l)}</option>`).join('')}</select>`
+  const second = opts.find((o) => o.v !== a)?.v
+  m.innerHTML = `<div class="box xwide"><h3>${ic('layers', 18)}Compare images</h3>
+    <div class="two"><label class="fld">Image A${sel('cmpa', a || opts[0].v)}</label><label class="fld">Image B${sel('cmpb', a ? second : opts[1].v)}</label></div>
+    <div id="cmpout" class="cmp"></div>
+    <div class="row"><button type="button" class="tb" id="cmpx">Close</button><button type="button" class="tb pri" id="cmpgo">${ic('layers', 15)}<span>Compare</span></button></div></div>`
+  document.body.append(m)
+  m.onclick = (e) => { if (e.target === m) closeModal() }
+  $('#cmpx', m).onclick = closeModal
+  const out = $('#cmpout', m)
+  const load = async (ref) => { const [o, h] = await Promise.all([api('image.inspect', ref), api('image.history', ref)]); return { o, h } }
+  const envOf = (o) => Object.fromEntries((o.Config?.Env || []).map((e) => { const k = e.indexOf('='); return k < 0 ? [e, ''] : [e.slice(0, k), e.slice(k + 1)] }))
+  const run = async () => {
+    const ra = $('#cmpa', m).value, rb = $('#cmpb', m).value
+    if (ra === rb) { out.innerHTML = '<div class="meta">Pick two different images.</div>'; return }
+    out.innerHTML = '<div class="meta">Comparing…</div>'
+    let A, B
+    try { [A, B] = await Promise.all([load(ra), load(rb)]) } catch (e) { out.innerHTML = `<div class="err">${esc(e.message)}</div>`; return }
+    const val = (x) => (Array.isArray(x) ? x.join(' ') : x == null ? '' : typeof x === 'object' ? Object.keys(x).join(', ') : String(x))
+    const rows = [
+      ['Size', fmt(A.o.Size), fmt(B.o.Size)],
+      ['Layers', String((A.o.RootFS?.Layers || []).length), String((B.o.RootFS?.Layers || []).length)],
+      ['Created', A.o.Created?.slice(0, 19).replace('T', ' '), B.o.Created?.slice(0, 19).replace('T', ' ')],
+      ['Platform', `${A.o.Os}/${A.o.Architecture}`, `${B.o.Os}/${B.o.Architecture}`],
+      ['User', val(A.o.Config?.User), val(B.o.Config?.User)],
+      ['Working dir', val(A.o.Config?.WorkingDir), val(B.o.Config?.WorkingDir)],
+      ['Entrypoint', val(A.o.Config?.Entrypoint), val(B.o.Config?.Entrypoint)],
+      ['Cmd', val(A.o.Config?.Cmd), val(B.o.Config?.Cmd)],
+      ['Exposed ports', val(A.o.Config?.ExposedPorts), val(B.o.Config?.ExposedPorts)]
+    ]
+    const ea = envOf(A.o), eb = envOf(B.o), keys = [...new Set([...Object.keys(ea), ...Object.keys(eb)])].sort()
+    const envRows = keys.filter((k) => ea[k] !== eb[k]).map((k) => `<tr><td class="mono">${esc(k)}</td><td class="mono ${k in ea ? '' : 'meta'}">${k in ea ? esc(ea[k]) : 'not set'}</td><td class="mono ${k in eb ? '' : 'meta'}">${k in eb ? esc(eb[k]) : 'not set'}</td></tr>`)
+    const key = (l) => `${layerCmd(l.CreatedBy)}\u0000${l.Size || 0}`
+    const count = (h) => { const m2 = new Map(); for (const l of h) m2.set(key(l), (m2.get(key(l)) || 0) + 1); return m2 }
+    const ca = count(A.h), cb = count(B.h)
+    const only = (h, other) => { const left = new Map(other); return h.filter((l) => { const n = left.get(key(l)) || 0; if (n > 0) { left.set(key(l), n - 1); return false } return true }) }
+    const oa = only(A.h, cb), ob = only(B.h, ca)
+    const shared = A.h.length - oa.length
+    const lay = (list) => list.length ? list.map((l) => `<div class="lcmp"><span class="nw meta">${fmt(l.Size || 0)}</span><span class="mono">${esc(layerCmd(l.CreatedBy).slice(0, 200))}</span></div>`).join('') : '<div class="meta">Nothing unique</div>'
+    out.innerHTML = `<table class="ctable"><thead><tr><th></th><th>A</th><th>B</th></tr></thead><tbody>${rows.map(([k, x, y]) => `<tr class="${x !== y ? 'diff' : ''}"><td class="meta">${k}</td><td class="mono">${esc(x) || '–'}</td><td class="mono">${esc(y) || '–'}</td></tr>`).join('')}</tbody></table>
+      <div class="dsub">Environment differences</div>${envRows.length ? `<table class="ctable"><thead><tr><th>Variable</th><th>A</th><th>B</th></tr></thead><tbody>${envRows.join('')}</tbody></table>` : '<div class="meta">Same environment variables.</div>'}
+      <div class="dsub">Layers · ${shared} shared</div><div class="two"><div><div class="meta">Only in A (${oa.length})</div>${lay(oa)}</div><div><div class="meta">Only in B (${ob.length})</div>${lay(ob)}</div></div>`
+  }
+  $('#cmpgo', m).onclick = run
+  run()
+}
+
+// ---------- Compose: profiles, .env, dependency graph, per-service scale ----------
+function scaleService(name, svc, current) {
+  const p = cProjects[name]; if (!p) return
+  formModal({ title: `Scale ${svc}`, icon: 'layers', intro: 'How many containers of this service should run. Services with a fixed container name or a fixed host port cannot be scaled.',
+    fields: [{ name: 'n', label: 'Number of containers', value: String(current) }], submit: 'Scale',
+    cli: (v) => `docker compose -p ${shq(p.name)} ${(p.files || '').split(',').filter(Boolean).map((f) => '-f ' + shq(f)).join(' ')} up -d --no-recreate --scale ${shq(svc + '=' + v.n)} ${shq(svc)}`.replace(/\s+/g, ' '),
+    run: (v) => api('compose.service', p.name, p.dir, p.files, svc, 'scale', Number(v.n)).then(() => toast(`${svc}: ${v.n} container${v.n === '1' ? '' : 's'}`)) })
+}
+async function composeProfiles(name) {
+  const p = cProjects[name]; if (!p) return
+  const file = (p.files || '').split(',')[0]
+  let profiles = []
+  try { profiles = file ? await api('compose.profiles', file) : [] } catch (e) { return toast(e.message, true) }
+  closeModal()
+  const m = document.createElement('div')
+  m.className = 'modal'
+  m.innerHTML = `<div class="box"><h3>${ic('play', 18)}Start ${esc(name)} with profiles</h3>
+    ${profiles.length ? `<p class="meta">Services that belong to a profile only start when you turn that profile on.</p><div class="profs">${profiles.map((x) => `<label class="chk"><input type="checkbox" value="${esc(x)}"> ${esc(x)}</label>`).join('')}</div>` : '<p class="meta">This project does not define any profiles.</p>'}
+    <div class="row"><button type="button" class="tb" id="pfx">Cancel</button><button type="button" class="tb pri" id="pfgo" ${profiles.length ? '' : 'disabled'}>${ic('play', 15)}<span>Start</span></button></div><div class="merr"></div></div>`
+  document.body.append(m)
+  const chosen = () => [...m.querySelectorAll('.profs input:checked')].map((x) => x.value)
+  cliButton(m, () => `docker compose -p ${shq(p.name)} ${(p.files || '').split(',').filter(Boolean).map((f) => '-f ' + shq(f)).join(' ')} ${chosen().map((x) => '--profile ' + shq(x)).join(' ')} up -d`.replace(/\s+/g, ' '))
+  m.onclick = (e) => { if (e.target === m) closeModal() }
+  $('#pfx', m).onclick = closeModal
+  $('#pfgo', m).onclick = async () => {
+    try { await api('compose.action', p.name, p.dir, p.files, 'up', chosen()); toast(`${name} started`); closeModal(); window.refresh?.() } catch (e) { $('.merr', m).innerHTML = `<div class="err">${esc(e.message)}</div>` }
+  }
+}
+async function composeEnv(name) {
+  const p = cProjects[name]; if (!p) return
+  const file = (p.files || '').split(',')[0]
+  if (!file) return toast('This project has no compose file on record', true)
+  let r
+  try { r = await api('compose.env.read', file) } catch (e) { return toast(e.message, true) }
+  closeModal()
+  const m = document.createElement('div')
+  m.className = 'modal'
+  m.innerHTML = `<div class="box xwide"><h3>${ic('logs', 18)}Environment of ${esc(name)}</h3>
+    <p class="meta">Variables for <span class="mono">\${…}</span> in the compose file. <span class="mono">${esc(r.file)}</span>${r.exists ? '' : ' (does not exist yet; saving creates it)'}. Changes apply the next time the project is started.</p>
+    ${r.writable ? '' : '<div class="err">This file is read-only for your user, so changes can\'t be saved.</div>'}
+    <textarea id="envta" class="yaml" spellcheck="false" wrap="off" placeholder="KEY=value">${esc(r.text)}</textarea><div class="merr"></div>
+    <div class="row"><button type="button" class="tb" id="envx">Close</button><button type="button" class="tb" id="envs" ${r.writable ? '' : 'disabled'}>${ic('copy', 14)}<span>Save</span></button><button type="button" class="tb pri" id="envgo" ${r.writable ? '' : 'disabled'}>${ic('play', 14)}<span>Save and apply</span></button></div></div>`
+  document.body.append(m)
+  const ta = $('#envta', m)
+  m.onclick = (e) => { if (e.target === m) closeModal() }
+  $('#envx', m).onclick = closeModal
+  ta.addEventListener('keydown', (e) => { if (e.key === 'Tab') { e.preventDefault(); document.execCommand('insertText', false, '  ') } })
+  const save = async () => { try { await api('compose.env.write', file, ta.value); return true } catch (e) { $('.merr', m).innerHTML = `<div class="err">${esc(e.message)}</div>`; return false } }
+  $('#envs', m).onclick = async () => { if (await save()) toast('Saved') }
+  $('#envgo', m).onclick = async () => {
+    if (!(await save())) return
+    try { await api('compose.action', p.name, p.dir, p.files, 'up'); toast('Saved and applied'); closeModal(); window.refresh?.() } catch (e) { $('.merr', m).innerHTML = `<div class="err">${esc(e.message)}</div>` }
+  }
+}
+async function composeGraph(name) {
+  const p = cProjects[name]; if (!p) return
+  const file = (p.files || '').split(',')[0]
+  if (!file) return toast('This project has no compose file on record', true)
+  let svcs
+  try { svcs = await api('compose.graph', file) } catch (e) { return toast(e.message, true) }
+  closeModal()
+  const byName = new Map(svcs.map((s) => [s.name, s]))
+  const depth = new Map()
+  const dep = (n, seen = new Set()) => {
+    if (depth.has(n)) return depth.get(n)
+    if (seen.has(n)) return 0 // a cycle: stop here
+    seen.add(n)
+    const d = Math.max(-1, ...(byName.get(n)?.depends || []).filter((x) => byName.has(x)).map((x) => dep(x, seen))) + 1
+    depth.set(n, d); return d
+  }
+  svcs.forEach((s) => dep(s.name))
+  const cols = []
+  for (const s of [...svcs].sort((a, b) => a.name.localeCompare(b.name))) (cols[depth.get(s.name)] ||= []).push(s)
+  const W = 190, H = 48, GX = 80, GY = 22, pos = new Map()
+  cols.forEach((col, ci) => col.forEach((s, ri) => pos.set(s.name, { x: 20 + ci * (W + GX), y: 20 + ri * (H + GY) })))
+  const width = 40 + cols.length * (W + GX) - GX, height = 40 + Math.max(...cols.map((c) => c.length)) * (H + GY) - GY
+  const stateOf = (n) => { const cs = p.cs.filter((c) => svcName(c) === n); return !cs.length ? 'none' : cs.some((c) => c.State === 'running') ? 'running' : 'stopped' }
+  const edges = svcs.flatMap((s) => s.depends.filter((d) => pos.has(d)).map((d) => { const a = pos.get(d), b = pos.get(s.name), x1 = a.x + W, y1 = a.y + H / 2, x2 = b.x, y2 = b.y + H / 2, mx = (x1 + x2) / 2; return `<path d="M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2 - 2},${y2}" fill="none" stroke="var(--mut)" stroke-width="1.4" marker-end="url(#arr)"/>` }))
+  const nodes = svcs.map((s) => { const q = pos.get(s.name), st = stateOf(s.name); return `<g transform="translate(${q.x},${q.y})"><rect width="${W}" height="${H}" rx="8" fill="var(--panel)" stroke="var(--line)"/><circle cx="14" cy="${H / 2}" r="5" fill="${st === 'running' ? 'var(--ok)' : st === 'stopped' ? 'var(--warn)' : 'var(--mut)'}"/><text x="28" y="${H / 2 - 3}" fill="var(--fg)" font-size="13" font-weight="600">${esc(s.name.length > 20 ? s.name.slice(0, 19) + '…' : s.name)}</text><text x="28" y="${H / 2 + 13}" fill="var(--mut)" font-size="11">${esc((s.profiles.length ? 'profile: ' + s.profiles.join(', ') : s.image || '').slice(0, 26))}</text></g>` })
+  const m = document.createElement('div')
+  m.className = 'modal'
+  m.innerHTML = `<div class="box xwide"><h3>${ic('layers', 18)}Dependencies of ${esc(name)}</h3>
+    <p class="meta">An arrow points from a service to the services that wait for it (<span class="mono">depends_on</span>). Green is running, orange stopped, grey not created.</p>
+    <div class="graph"><svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"><defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--mut)"/></marker></defs>${edges.join('')}${nodes.join('')}</svg></div>
+    <div class="row"><button type="button" class="tb" id="gx">Close</button></div></div>`
+  document.body.append(m)
+  m.onclick = (e) => { if (e.target === m) closeModal() }
+  $('#gx', m).onclick = closeModal
+}
+
+
+// Combined logs of every container in a Compose project: one live stream per container, merged in arrival order,
+// each line prefixed with a colour-coded service name. Service chips hide or show a service.
+const SVC_COLORS = ['#4f9cf9', '#e0a030', '#4cc38a', '#d86fcf', '#e5645a', '#36c5c5', '#a38af0', '#c0c050']
+function projectLogs(name) {
+  const p = cProjects[name]; if (!p) return
+  closeDetail()
+  const MAX = 20000
+  const svcs = [...new Set(p.cs.map(svcName))].sort()
+  const color = (s) => SVC_COLORS[svcs.indexOf(s) % SVC_COLORS.length]
+  const o = { q: '', follow: true, hidden: new Set() }
+  let lines = [], rendered = 0, raf = 0
+  const d = document.createElement('div')
+  d.className = 'detail'
+  d.innerHTML = `<header>${ic('logs', 18)}<b>${esc(name)}</b><span class="meta">combined logs</span><button class="ib" id="x" title="Close">${ic('x')}</button></header>
+    <div class="pane flush"><div class="lv"><div class="lbar2">
+      <label class="search">${ic('search', 14)}<input type="text" id="pq" placeholder="Filter lines" autocomplete="off" spellcheck="false"></label>
+      <label class="chk"><input type="checkbox" id="pfollow" checked> Follow</label><span class="sp"></span>
+      <button class="tb" id="pclear">${ic('x', 14)}<span>Clear</span></button></div>
+      <div class="lbar2" id="pchips">${svcs.map((s) => `<button type="button" class="vchip on" data-svc="${esc(s)}" style="border-color:${color(s)}"><span class="sw" style="background:${color(s)}"></span> ${esc(s)}</button>`).join('')}</div>
+      <div class="lscroll" id="pscroll"><div id="plines"></div></div><div class="lstat meta" id="pstat"></div></div></div>`
+  document.body.append(d)
+  $('#x', d).onclick = closeDetail
+  const scroll = $('#pscroll', d), box = $('#plines', d)
+  const ok = (l) => !o.hidden.has(l.svc) && (!o.q || plainOf(l.text).toLowerCase().includes(o.q.toLowerCase()))
+  const mk = (l) => { const e = document.createElement('div'); e.className = 'll ' + lineLevel(plainOf(l.text)); e.innerHTML = `<span class="psvc" style="color:${color(l.svc)}">${esc(l.svc.padEnd(Math.min(16, Math.max(...svcs.map((x) => x.length)))))}</span> ${logLineHtml(l.text, o.q) || ' '}`; return e }
+  const flush = () => {
+    raf = 0
+    const frag = document.createDocumentFragment()
+    for (; rendered < lines.length; rendered++) if (ok(lines[rendered])) frag.append(mk(lines[rendered]))
+    box.append(frag)
+    $('#pstat', d).textContent = `${lines.length.toLocaleString()} lines from ${p.cs.length} container${p.cs.length === 1 ? '' : 's'}`
+    if (o.follow) scroll.scrollTop = scroll.scrollHeight
+  }
+  const renderAll = () => { box.textContent = ''; rendered = 0; flush() }
+  const schedule = () => { if (!raf) raf = requestAnimationFrame(flush) }
+  for (const c of p.cs) {
+    const svc = svcName(c); let partial = ''
+    const stop = stream('logs', { id: c.Id, tail: '100', ts: '0' }, (m) => {
+      if (m.k !== 'data') return
+      const parts = (partial + m.d.replace(/\r/g, '')).split('\n'); partial = parts.pop()
+      if (!parts.length) return
+      for (const t of parts) lines.push({ svc, text: t })
+      if (lines.length > MAX) { lines = lines.slice(-MAX + 2000); renderAll() } else schedule()
+    })
+    stops.push(stop)
+  }
+  let tmr
+  $('#pq', d).addEventListener('input', (e) => { clearTimeout(tmr); tmr = setTimeout(() => { o.q = e.target.value; renderAll() }, 180) })
+  $('#pfollow', d).onchange = (e) => { o.follow = e.target.checked; if (o.follow) scroll.scrollTop = scroll.scrollHeight }
+  $('#pclear', d).onclick = () => { lines = []; renderAll() }
+  $('#pchips', d).onclick = (e) => {
+    const b = e.target.closest('[data-svc]'); if (!b) return
+    const sv = b.dataset.svc
+    o.hidden.has(sv) ? o.hidden.delete(sv) : o.hidden.add(sv)
+    b.classList.toggle('on', !o.hidden.has(sv)); b.style.opacity = o.hidden.has(sv) ? .45 : 1
+    renderAll()
+  }
+  scroll.addEventListener('scroll', () => {
+    const atBottom = scroll.scrollTop + scroll.clientHeight >= scroll.scrollHeight - 24
+    if (atBottom !== o.follow && !raf) { o.follow = atBottom; $('#pfollow', d).checked = atBottom }
+  })
 }
 function placeMenu(btn) {
   const m = $('#menu'); m.hidden = false
@@ -1104,12 +1517,12 @@ const visibleImages = () => {
 function imageRows() {
   return visibleImages().map((r) => `<tr class="row-click" data-inspect="image:${esc(r.id)}:${esc(r.ref.startsWith('sha256:') ? r.repo : r.ref)}">
     <td class="cb"><input type="checkbox" class="isel" data-ref="${esc(r.ref)}" ${isel.has(r.ref) ? 'checked' : ''}></td>
-    <td><div class="namecell"><span class="nm">${esc(r.repo)}</span>${r.usedBy.length ? `<span class="pill running" title="${esc(r.usedBy.join(', '))}">In use</span>` : ''}${r.dangling ? '<span class="pill warn">dangling</span>' : ''}</div></td>
+    <td><div class="namecell"><span class="nm">${esc(r.repo)}</span>${r.usedBy.length ? `<span class="pill running" title="${esc(r.usedBy.join(', '))}">In use</span>` : ''}${r.dangling ? '<span class="pill warn">dangling</span>' : ''}${iUpdates.get(r.ref) === true ? '<span class="pill warn" title="A newer version of this tag exists in the registry">update available</span>' : ''}</div></td>
     <td class="mono">${esc(r.tag)}</td>
     <td class="mono">${short(r.id)}</td>
     <td class="nw">${rel(new Date(r.created * 1000).toISOString())}</td>
     <td class="nw">${fmt(r.size)}</td>
-    <td><div class="actions">${ibtn('play', 'Run', call('run', r.ref), 'ok')}${ibtn('more', 'More actions', call('imenu', r.ref))}${ibtn('trash', 'Delete', call('confirm', `Delete ${r.dangling ? short(r.id) : r.ref}?`, 'image.remove', r.ref, false), 'dan')}</div></td></tr>`).join('') ||
+    <td><div class="actions">${ibtn('play', 'Run', call('run', r.ref), 'ok')}${iUpdates.get(r.ref) === true ? ibtn('download', 'Pull the update', call('pull', r.ref)) : ''}${ibtn('more', 'More actions', call('imenu', r.ref))}${ibtn('trash', 'Delete', call('confirm', `Delete ${r.dangling ? short(r.id) : r.ref}?`, 'image.remove', r.ref, false), 'dan')}</div></td></tr>`).join('') ||
     `<tr><td colspan="7"><div class="empty">No matching images</div></td></tr>`
 }
 
@@ -1119,12 +1532,14 @@ async function images() {
   for (const ref of [...isel]) if (!iList.some((r) => r.ref === ref)) isel.delete(ref)
   const total = list.reduce((a, i) => a + i.Size, 0)
   const inUse = list.filter((i) => cs.some((c) => c.ImageID === i.Id)).reduce((a, i) => a + i.Size, 0)
-  return `<div class="head"><h2>${ic('image', 22)}Images<span class="count">${list.length}</span></h2>
+  return `<div class="head"><h2>${ic('image', 22)}${tr('Images')}<span class="count">${list.length}</span></h2>
     <div class="usage"><div><div class="k">${list.length} image${list.length === 1 ? '' : 's'}</div><div class="v"><b>${fmt(inUse)}</b> / ${fmt(total)}</div><div class="s">in use</div></div></div></div>
     <div class="tools">
       <label class="search">${ic('search', 15)}<input type="text" id="iq" placeholder="Search" value="${esc(iq)}"></label>
       <select id="ifilter">${[['all', 'All images'], ['inuse', 'In use'], ['unused', 'Unused'], ['dangling', 'Dangling']].map(([v, l]) => `<option value="${v}" ${ifilter === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
       <span class="sp"></span>
+      ${tbtn('arrowup', 'Check for updates', call('imgupdates'))}
+      ${tbtn('layers', 'Compare', call('cmpimg'))}
       ${tbtn('upload', 'Import', call('importimg'))}
       ${tbtn('hammer', 'Build image', call('build'))}
       ${tbtn('download', 'Pull image', '["pull"]', 'pri')}
@@ -1169,6 +1584,8 @@ function showImageMenu(btn, ref) {
     item('play', 'Run', call('run', ref)),
     item('info', 'View details', call('inspectimg', r.id, r.dangling ? r.repo : ref)),
     r.dangling ? '' : item('download', 'Pull latest', call('pull', ref)),
+    item('info', 'Scan for vulnerabilities', call('inspectimg', r.id, r.dangling ? r.repo : ref, 'Vulnerabilities')),
+    item('layers', 'Compare with…', call('cmpimg', ref)),
     item('layers', 'Tag…', call('tagimg', ref)),
     r.dangling ? '' : item('ext', 'Push…', call('pushimg', ref)),
     item('upload', 'Export…', call('exportimg', ref)),
@@ -1182,23 +1599,140 @@ function showImageMenu(btn, ref) {
   m.style.top = (b.bottom + mh + 8 > innerHeight - 30 ? b.top - mh - 4 : b.bottom + 4) + 'px'
 }
 
+// ---- Run dialog helpers: a "spec" is the form's content: { image, name, ports: [[host, container, proto]], volumes: [[host, container]], env: [[k, v]], bind, net, restart, mem, cpu, caps: [], dev: [], it, priv }
+function runCommand(sp) {
+  const a = ['docker run -d']
+  if (sp.name) a.push('--name', shq(sp.name))
+  if (sp.it) a.push('-it')
+  if (sp.net && sp.net !== 'bridge') a.push('--network', shq(sp.net))
+  if (sp.net !== 'host') for (const [h, c, pr] of sp.ports) if (c) a.push('-p', `${sp.bind || '127.0.0.1'}:${h}:${c}${pr === 'udp' ? '/udp' : ''}`)
+  for (const [h, c] of sp.volumes) if (h && c) a.push('-v', shq(`${h}:${c}`))
+  for (const [k, v] of sp.env) if (k) a.push('-e', shq(`${k}=${v}`))
+  if (sp.restart && sp.restart !== 'no') a.push('--restart', sp.restart)
+  if (sp.mem) a.push('--memory', `${sp.mem}m`)
+  if (sp.cpu) a.push('--cpus', String(sp.cpu))
+  for (const c of sp.caps) a.push('--cap-add', c.toUpperCase())
+  for (const d of sp.dev) a.push('--device', shq(d))
+  if (sp.priv) a.push('--privileged')
+  a.push(shq(sp.image))
+  return a.join(' ')
+}
+function composeFromSpec(sp) {
+  const q = (x) => JSON.stringify(String(x)) // a JSON string is a valid YAML string
+  const svc = (sp.name || sp.image.split('/').pop().split(':')[0] || 'app').toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '') || 'app'
+  const L = ['services:', `  ${svc}:`, `    image: ${q(sp.image)}`]
+  if (sp.name) L.push(`    container_name: ${q(sp.name)}`)
+  const ports = sp.net === 'host' ? [] : sp.ports.filter(([, c]) => c)
+  if (ports.length) { L.push('    ports:'); for (const [h, c, pr] of ports) L.push(`      - ${q(`${sp.bind || '127.0.0.1'}:${h}:${c}${pr === 'udp' ? '/udp' : ''}`)}`) }
+  const vols = sp.volumes.filter(([h, c]) => h && c)
+  if (vols.length) { L.push('    volumes:'); for (const [h, c] of vols) L.push(`      - ${q(`${h}:${c}`)}`) }
+  const env = sp.env.filter(([k]) => k)
+  if (env.length) { L.push('    environment:'); for (const [k, v] of env) L.push(`      - ${q(`${k}=${v}`)}`) }
+  if (sp.restart && sp.restart !== 'no') L.push(`    restart: ${sp.restart}`)
+  if (sp.mem) L.push(`    mem_limit: ${q(sp.mem + 'm')}`)
+  if (sp.cpu) L.push(`    cpus: ${sp.cpu}`)
+  if (sp.caps.length) { L.push('    cap_add:'); for (const c of sp.caps) L.push(`      - ${c.toUpperCase()}`) }
+  if (sp.dev.length) { L.push('    devices:'); for (const d of sp.dev) L.push(`      - ${q(d)}`) }
+  if (sp.priv) L.push('    privileged: true')
+  if (sp.it) L.push('    tty: true', '    stdin_open: true')
+  const custom = sp.net && !['bridge', 'host', 'none'].includes(sp.net)
+  if (sp.net === 'host' || sp.net === 'none') L.push(`    network_mode: ${sp.net}`)
+  else if (custom) L.push('    networks:', `      - ${q(sp.net)}`)
+  if (custom) L.push('', 'networks:', `  ${q(sp.net)}:`, '    external: true')
+  return L.join('\n') + '\n'
+}
+// Split a shell command line into words (quotes and backslashes only; no expansion).
+function shellWords(text) {
+  const out = []; let cur = '', has = false, q = '', i = 0
+  text = text.replace(/\\\r?\n/g, ' ')
+  for (; i < text.length; i++) {
+    const ch = text[i]
+    if (q) { if (ch === q) q = ''; else if (ch === '\\' && q === '"' && /["\\$`]/.test(text[i + 1] || '')) cur += text[++i]; else cur += ch }
+    else if (ch === '"' || ch === "'") { q = ch; has = true }
+    else if (ch === '\\') { cur += text[++i] ?? ''; has = true }
+    else if (/\s/.test(ch)) { if (cur || has) out.push(cur); cur = ''; has = false }
+    else cur += ch
+  }
+  if (cur || has) out.push(cur)
+  return out
+}
+// The reverse of runCommand: read a `docker run …` line back into a spec. Returns { spec, skipped: [flags we don't know] }.
+function parseRunCommand(text) {
+  let w = shellWords(String(text).trim().replace(/^\$\s*/, ''))
+  if (w[0] === 'sudo') w = w.slice(1)
+  if (w[0] !== 'docker') throw new Error('That does not start with “docker run”')
+  w = w.slice(1)
+  if (w[0] === 'container') w = w.slice(1)
+  if (w[0] !== 'run') throw new Error('That does not start with “docker run”')
+  w = w.slice(1)
+  const sp = { image: '', name: '', ports: [], volumes: [], env: [], bind: '127.0.0.1', net: 'bridge', restart: 'no', mem: '', cpu: '', caps: [], dev: [], it: false, priv: false }
+  const skipped = []
+  const WITH_VALUE = new Set(['--name', '-p', '--publish', '-v', '--volume', '-e', '--env', '--network', '--net', '--restart', '-m', '--memory', '--cpus', '--cap-add', '--device'])
+  const SKIP_VALUE = new Set(['-w', '--workdir', '-u', '--user', '-h', '--hostname', '--entrypoint', '-l', '--label', '--env-file', '--add-host', '--dns', '--platform', '--pull', '--log-driver', '--ulimit', '--shm-size', '--memory-swap', '--cpu-shares', '--health-cmd', '--mount', '--tmpfs', '--security-opt', '--pid', '--ipc', '--ip', '--expose', '--group-add', '--runtime', '--gpus', '--stop-signal', '--stop-timeout', '--workdir'])
+  let i = 0
+  for (; i < w.length; i++) {
+    let a = w[i], val
+    if (!a.startsWith('-') || a === '-') break
+    if (a.startsWith('--') && a.includes('=')) { val = a.slice(a.indexOf('=') + 1); a = a.slice(0, a.indexOf('=')) }
+    if (/^-[a-zA-Z]{2,}$/.test(a) && !WITH_VALUE.has(a)) { // combined short flags like -dit
+      for (const f of a.slice(1)) { if (f === 'i' || f === 't') sp.it = true; else if (!'d'.includes(f)) skipped.push('-' + f) }
+      continue
+    }
+    const next = () => (val !== undefined ? val : w[++i])
+    if (a === '-d' || a === '--detach' || a === '--rm' || a === '--init') continue
+    if (a === '-i' || a === '-t' || a === '--interactive' || a === '--tty') { sp.it = true; continue }
+    if (a === '--privileged') { sp.priv = val !== 'false'; continue }
+    if (WITH_VALUE.has(a)) {
+      const v = next() ?? ''
+      if (a === '--name') sp.name = v
+      else if (a === '-p' || a === '--publish') {
+        const parts = v.split('/'); const proto = parts[1] === 'udp' ? 'udp' : 'tcp'
+        const seg = parts[0].split(':')
+        let host = '', cont = ''
+        if (seg.length === 1) cont = seg[0]
+        else if (seg.length === 2) [host, cont] = seg
+        else { if (seg[0] === '0.0.0.0' || seg[0] === '127.0.0.1') sp.bind = seg[0]; else skipped.push(`${seg[0]} (bind address)`); host = seg[1]; cont = seg[2] }
+        if (!/^\d+$/.test(cont)) skipped.push('-p ' + v); else sp.ports.push([host, cont, proto])
+      }
+      else if (a === '-v' || a === '--volume') { const k = v.indexOf(':'); if (k < 0) skipped.push('-v ' + v); else { const dst = v.slice(k + 1); if (/:(ro|z|Z)$/.test(dst)) skipped.push(`${v} (volume options)`); sp.volumes.push([v.slice(0, k), dst.replace(/:(ro|rw|z|Z)$/, '')]) } }
+      else if (a === '-e' || a === '--env') { const k = v.indexOf('='); sp.env.push(k < 0 ? [v, ''] : [v.slice(0, k), v.slice(k + 1)]) }
+      else if (a === '--network' || a === '--net') sp.net = v
+      else if (a === '--restart') sp.restart = v.replace(/:\d+$/, '')
+      else if (a === '-m' || a === '--memory') { const mm = /^(\d+(?:\.\d+)?)([bkmg]?)$/i.exec(v); if (mm) sp.mem = String(Math.max(1, Math.round(Number(mm[1]) * ({ b: 1 / 1048576, k: 1 / 1024, m: 1, g: 1024, '': 1 / 1048576 }[mm[2].toLowerCase()])))); else skipped.push('--memory ' + v) }
+      else if (a === '--cpus') sp.cpu = v
+      else if (a === '--cap-add') sp.caps.push(v)
+      else if (a === '--device') sp.dev.push(v.split(':')[0])
+      continue
+    }
+    skipped.push(a); if (SKIP_VALUE.has(a) && val === undefined) i++
+  }
+  sp.image = w[i] || ''
+  if (!sp.image) throw new Error('No image name found in that command')
+  return { spec: sp, skipped }
+}
+const RUN_PRESETS_KEY = 'runPresets'
+const loadPresets = () => { try { return JSON.parse(localStorage.getItem(RUN_PRESETS_KEY) || '{}') } catch { return {} } }
+const savePresets = (o) => { try { localStorage.setItem(RUN_PRESETS_KEY, JSON.stringify(o)) } catch { toast('Could not save presets in this browser', true) } }
+
 // "Run a new container" dialog: name, ports, volumes, environment variables.
 async function runImage(ref) {
   closeModal()
-  let exposed = [], nets = []
+  let exposed = [], nets = [], img = ref
   try {
-    const img = await api('image.inspect', ref)
-    exposed = Object.keys(img.Config?.ExposedPorts || {}).map((p) => p.split('/')) // [['5432','tcp']]
+    const imgInfo = await api('image.inspect', ref)
+    exposed = Object.keys(imgInfo.Config?.ExposedPorts || {}).map((p) => p.split('/')) // [['5432','tcp']]
     nets = (await api('networks.list')).map((n) => n.Name).filter((n) => !['bridge', 'host', 'none'].includes(n))
   } catch (e) { return toast(e.message, true) }
   const m = document.createElement('div')
   m.className = 'modal'
   const rowsOf = (kind) => `<div class="rows" data-kind="${kind}"></div><button type="button" class="tb" data-add="${kind}">${ic('plus', 14)}<span>Add ${kind === 'ports' ? 'port' : kind === 'volumes' ? 'volume' : 'variable'}</span></button>`
   m.innerHTML = `<div class="box wide"><h3>${ic('play', 18)}Run a new container</h3>
-    <p class="meta mono">${esc(ref)}</p>
+    <p class="meta mono" id="rimg">${esc(ref)}</p>
+    <div class="presetbar"><select id="rpre"></select><button type="button" class="tb" id="rpsave" title="Save this setup under a name">${ic('copy', 14)}<span>Save preset</span></button><button type="button" class="tb" id="rpdel" hidden>${ic('trash', 14)}<span>Delete</span></button><span class="sp"></span><button type="button" class="tb" id="rpaste" title="Fill the form from a docker run command">${ic('terminal', 14)}<span>Paste docker run…</span></button></div>
+    <div id="rpastebox" class="pastebox" hidden><textarea class="yaml" spellcheck="false" placeholder="docker run -d --name web -p 8080:80 nginx:alpine"></textarea><div class="row"><button type="button" class="tb pri" id="rpapply">Fill the form</button></div></div>
     <form>
       <label class="fld">Container name<input type="text" id="rn" placeholder="Leave empty for a random name" autocomplete="off" spellcheck="false"></label>
-      <div class="fld">Ports <span class="meta">(host port empty = random)</span>${rowsOf('ports')}</div>
+      <div class="fld">Ports <span class="meta">(host port empty = random)</span>${rowsOf('ports')}<div id="rwarn"></div></div>
       <div class="fld">Volumes <span class="meta">(host path or volume name → container path)</span>${rowsOf('volumes')}</div>
       <div class="fld">Environment variables${rowsOf('env')}</div>
       <details class="fld adv"><summary>Advanced options</summary>
@@ -1212,7 +1746,7 @@ async function runImage(ref) {
         <label class="chk"><input type="checkbox" id="ra-it"> Keep it open with a terminal (needed for shell images such as Kali)</label>
         <label class="chk danger"><input type="checkbox" id="ra-priv"> Privileged: full access to this machine's devices and kernel</label>
       </details>
-      <div class="row"><button type="button" class="tb" id="rcancel">Cancel</button><button class="tb pri" id="rgo">${ic('play', 15)}<span>Run</span></button></div>
+      <div class="row"><button type="button" class="tb" id="rcopy" title="Copy the equivalent docker run command">${ic('terminal', 15)}<span>Copy as docker run</span></button><button type="button" class="tb" id="rccopy" title="Copy as a compose file">${ic('layers', 15)}<span>Copy as Compose</span></button><span class="sp"></span><button type="button" class="tb" id="rcancel">Cancel</button><button class="tb pri" id="rgo">${ic('play', 15)}<span>Run</span></button></div>
     </form><div id="rerr"></div></div>`
   document.body.append(m)
   const form = $('form', m)
@@ -1233,23 +1767,89 @@ async function runImage(ref) {
   $('#rn', m).focus()
   $('#ra-net', m).onchange = (e) => ($('#ra-hostnote', m).hidden = e.target.value !== 'host')
   const collect = (kind) => [...$$(`.rows[data-kind="${kind}"] .rrow`, m)].map((r) => [...r.querySelectorAll('input,select')].map((x) => x.value))
+  const list = (id) => $(id, m).value.split(',').map((x) => x.trim()).filter(Boolean)
+  const readSpec = () => ({
+    image: img, name: $('#rn', m).value.trim(), ports: collect('ports'), volumes: collect('volumes'), env: collect('env'),
+    bind: $('#ra-bind', m).value, net: $('#ra-net', m).value, restart: $('#ra-restart', m).value,
+    mem: Number($('#ra-mem', m).value) || '', cpu: Number($('#ra-cpu', m).value) || '', caps: list('#ra-caps'), dev: list('#ra-dev'),
+    it: $('#ra-it', m).checked, priv: $('#ra-priv', m).checked
+  })
+  const writeSpec = (sp) => {
+    img = sp.image || img; $('#rimg', m).textContent = img
+    for (const k of ['ports', 'volumes', 'env']) $(`.rows[data-kind="${k}"]`, m).textContent = ''
+    sp.ports.forEach(([h, c, pr]) => { addRow('ports', h, c); if (pr === 'udp') [...$$('.rows[data-kind="ports"] select', m)].pop().value = 'udp' })
+    sp.volumes.forEach(([h, c]) => addRow('volumes', h, c)); sp.env.forEach(([k, v]) => addRow('env', k, v))
+    $('#rn', m).value = sp.name || ''
+    $('#ra-bind', m).value = sp.bind === '0.0.0.0' ? '0.0.0.0' : '127.0.0.1'
+    const net = $('#ra-net', m)
+    if (sp.net && ![...net.options].some((o) => o.value === sp.net)) net.add(new Option(sp.net))
+    net.value = sp.net || 'bridge'; $('#ra-hostnote', m).hidden = net.value !== 'host'
+    $('#ra-restart', m).value = ['no', 'unless-stopped', 'always', 'on-failure'].includes(sp.restart) ? sp.restart : 'no'
+    $('#ra-mem', m).value = sp.mem || ''; $('#ra-cpu', m).value = sp.cpu || ''
+    $('#ra-caps', m).value = (sp.caps || []).join(', '); $('#ra-dev', m).value = (sp.dev || []).join(', ')
+    $('#ra-it', m).checked = !!sp.it; $('#ra-priv', m).checked = !!sp.priv
+    if (sp.net !== 'bridge' || sp.restart !== 'no' || sp.mem || sp.cpu || sp.caps?.length || sp.dev?.length || sp.it || sp.priv || sp.bind === '0.0.0.0') $('.adv', m).open = true
+    checkPorts()
+  }
+  $('#rcopy', m).onclick = async () => { const ok = await copyText(runCommand(readSpec())); toast(ok ? 'Copied the docker run command' : 'Could not copy', !ok) }
+  $('#rccopy', m).onclick = async () => { const ok = await copyText(composeFromSpec(readSpec())); toast(ok ? 'Copied as a compose file' : 'Could not copy', !ok) }
+  // presets (kept in this browser)
+  const drawPresets = (cur = '') => {
+    const ps = loadPresets()
+    $('#rpre', m).innerHTML = '<option value="">Presets…</option>' + Object.keys(ps).sort().map((n) => `<option ${n === cur ? 'selected' : ''}>${esc(n)}</option>`).join('')
+    $('#rpdel', m).hidden = !cur
+  }
+  drawPresets()
+  $('#rpre', m).onchange = (e) => { const sp = loadPresets()[e.target.value]; drawPresets(e.target.value); if (sp) { writeSpec(sp); toast(`Loaded “${e.target.value}”${sp.image !== ref ? ` (image ${sp.image})` : ''}`) } }
+  $('#rpsave', m).onclick = () => {
+    const name = (prompt('Save this setup as…', $('#rpre', m).value || $('#rn', m).value.trim() || img.split('/').pop().split(':')[0]) || '').trim().slice(0, 60)
+    if (!name) return
+    const ps = loadPresets(); ps[name] = readSpec(); savePresets(ps); drawPresets(name); toast(`Saved preset “${name}”`)
+  }
+  $('#rpdel', m).onclick = () => { const n = $('#rpre', m).value; if (!n || !confirm(`Delete the preset “${n}”?`)) return; const ps = loadPresets(); delete ps[n]; savePresets(ps); drawPresets(); toast('Preset deleted') }
+  // paste a `docker run …` command to fill the form
+  $('#rpaste', m).onclick = () => { const b = $('#rpastebox', m); b.hidden = !b.hidden; if (!b.hidden) $('textarea', b).focus() }
+  $('#rpapply', m).onclick = () => {
+    try {
+      const { spec, skipped } = parseRunCommand($('#rpastebox textarea', m).value)
+      writeSpec(spec); $('#rpastebox', m).hidden = true
+      toast(skipped.length ? `Filled the form. Not supported here, so left out: ${skipped.join(', ')}` : 'Filled the form from the command', !!skipped.length)
+    } catch (err) { toast(err.message, true) }
+  }
+  // warn about host ports that something else already uses
+  let portTmr, portSeq = 0
+  const checkPorts = () => {
+    clearTimeout(portTmr)
+    portTmr = setTimeout(async () => {
+      const seq = ++portSeq, hosts = collect('ports').map((r) => Number(r[0])).filter((n) => n > 0)
+      const w = $('#rwarn', m)
+      if (!hosts.length || $('#ra-net', m).value === 'host') { w.innerHTML = ''; return }
+      try {
+        const used = await api('ports.check', hosts)
+        if (seq !== portSeq || !m.isConnected) return
+        const bad = Object.entries(used)
+        w.innerHTML = bad.length ? `<div class="warnbox">${ic('info', 15)}<div>${bad.map(([pt, who]) => `Port <b>${pt}</b> is already in use by ${esc(who)}.`).join('<br>')}<div class="meta">Docker will fail to start the container. Pick another host port, or leave it empty for a random one.</div></div></div>` : ''
+      } catch { w.innerHTML = '' }
+    }, 300)
+  }
+  m.addEventListener('input', (e) => { if (e.target.closest('.rows[data-kind="ports"]')) checkPorts() })
+  checkPorts()
   form.onsubmit = async (e) => {
     e.preventDefault()
     const go = $('#rgo', m); go.disabled = true
     $('#rerr', m).innerHTML = ''
-    const list = (id) => $(id, m).value.split(',').map((x) => x.trim()).filter(Boolean)
     if ($('#ra-priv', m).checked && !confirm('Privileged containers can take over this machine (they get its devices and can change the kernel). Run it privileged anyway?')) { go.disabled = false; return }
     try {
       await api('container.run', {
         bindIp: $('#ra-bind', m).value, network: $('#ra-net', m).value, restart: $('#ra-restart', m).value,
         memoryMb: Number($('#ra-mem', m).value) || 0, cpus: Number($('#ra-cpu', m).value) || 0,
         caps: list('#ra-caps'), devices: list('#ra-dev'), interactive: $('#ra-it', m).checked, privileged: $('#ra-priv', m).checked,
-        image: ref, name: $('#rn', m).value,
+        image: img, name: $('#rn', m).value,
         ports: collect('ports').map(([host, container, proto]) => ({ host, container, proto })),
         volumes: collect('volumes').map(([host, container]) => ({ host, container })),
         env: collect('env').map(([key, value]) => ({ key, value }))
       })
-      toast(`Started a container from ${ref}`); closeModal(); go_('containers')
+      toast(`Started a container from ${img}`); closeModal(); go_('containers')
     } catch (err) { $('#rerr', m).innerHTML = `<div class="err">${esc(err.message)}</div>`; go.disabled = false }
   }
 }
@@ -1271,6 +1871,7 @@ async function buildImage() {
     </form><pre class="log buildlog" id="blog" hidden></pre><div id="berr"></div></div>`
   document.body.append(m)
   const dir = $('#bdir', m), pick = $('#bpick', m), file = $('#bfile', m), log = $('#blog', m)
+  cliButton(m, () => { const d = dir.value.trim(), t = $('#btag', m).value.trim(); if (!d) throw new Error('Choose a folder first'); return `docker build -f ${shq(d.replace(/\/$/, '') + '/' + file.value)}${t ? ' -t ' + shq(t) : ''}${$('#bnc', m).checked ? ' --no-cache' : ''} ${shq(d)}` })
   let stopBuild = null, seq = 0, tmr
   const closeAll = () => { stopBuild?.(); closeModal() }
   $('#bclose', m).onclick = closeAll
@@ -1343,6 +1944,7 @@ function exportImage(ref) {
   document.body.append(m)
   let stop = null
   const dir = $('#xdir', m)
+  cliButton(m, () => `docker save -o ${shq(dir.value.trim().replace(/\/$/, '') + '/' + $('#xname', m).value.trim())} ${shq(ref)}`)
   attachPicker(m, dir, $('#xpick', m))
   $('#xclose', m).onclick = () => { stop?.(); closeModal() }
   m.onclick = (e) => { if (e.target === m) { stop?.(); closeModal() } }
@@ -1371,6 +1973,7 @@ function importImage() {
   document.body.append(m)
   let stop = null
   const path = $('#ipath', m), picker = $('#ipick', m)
+  cliButton(m, () => { if (!path.value.trim()) throw new Error('Pick or type an archive file first'); return `docker load -i ${shq(path.value.trim())}` })
   // the path box holds the chosen file; the picker browses folders next to it
   const fake = document.createElement('input')
   attachPicker(m, fake, picker, { files: true, onPickFile: (f) => (path.value = f) })
@@ -1396,7 +1999,7 @@ function tagImage(ref) {
   const [repo, tag] = ref.startsWith('sha256:') ? ['', 'latest'] : splitRef(ref)
   formModal({ title: 'Tag image', icon: 'layers', intro: 'Adds another name to this image. To push to a registry, start the name with its address, e.g. localhost:5000/myapp or myuser/myapp.',
     fields: [{ name: 'repo', label: 'Name', value: repo, placeholder: 'myuser/myapp' }, { name: 'tag', label: 'Tag', value: tag === '<none>' ? 'latest' : tag, placeholder: 'latest' }],
-    submit: 'Tag', run: (v) => api('image.tag', ref, v.repo, v.tag).then(() => toast(`Tagged ${v.repo}:${v.tag}`)) })
+    submit: 'Tag', cli: (v) => `docker tag ${shq(ref)} ${shq(v.repo + ':' + v.tag)}`, run: (v) => api('image.tag', ref, v.repo, v.tag).then(() => toast(`Tagged ${v.repo}:${v.tag}`)) })
 }
 
 // Push an image with `docker push`; sign-in lives in Settings → Registries.
@@ -1408,6 +2011,7 @@ function pushImage(ref) {
     <div class="row"><button type="button" class="tb" id="pclose">Close</button></div></div>`
   document.body.append(m)
   const log = $('#plog', m)
+  cliButton(m, () => `docker push ${shq(ref)}`)
   let pending = '', raf = 0
   const stop = stream('push', { ref }, (ev) => {
     if (ev.k === 'data') { pending += ev.d; if (!raf) raf = requestAnimationFrame(() => { raf = 0; log.append(pending); pending = ''; log.scrollTop = log.scrollHeight }) }
@@ -1421,7 +2025,7 @@ function pushImage(ref) {
 function registryLogin() {
   formModal({ title: 'Sign in to a registry', icon: 'download', intro: 'Leave the registry empty for Docker Hub. For Docker Hub use an access token instead of your password.',
     fields: [{ name: 'server', label: 'Registry (optional)', placeholder: 'ghcr.io, localhost:5000, …' }, { name: 'user', label: 'Username' }, { name: 'password', label: 'Password or access token', type: 'password' }],
-    submit: 'Sign in', run: (v) => api('registry.login', v.server, v.user, v.password).then(() => toast('Signed in')) })
+    submit: 'Sign in', cli: (v) => `docker login${v.server ? ' ' + shq(v.server) : ''} -u ${shq(v.user)}`, run: (v) => api('registry.login', v.server, v.user, v.password).then(() => toast('Signed in')) })
 }
 
 function pullImage(prefill = '', auto = false) {
@@ -1436,6 +2040,7 @@ function pullImage(prefill = '', auto = false) {
     <div id="pstat"></div></div>`
   document.body.append(m)
   const input = $('#pimg', m), go = $('#pgo', m), out = $('#pstat', m)
+  cliButton(m, () => { const n = input.value.trim(); if (!n) throw new Error('Type an image name first'); return `docker pull ${shq(n)}` })
   input.focus()
   $('#pcancel', m).onclick = () => { stopPull?.(); closeModal() }
   m.onclick = (e) => { if (e.target === m) { stopPull?.(); closeModal() } }
@@ -1541,7 +2146,7 @@ document.addEventListener('change', (e) => {
 })
 
 // Small reusable "create something" dialog
-function formModal({ title, icon, intro, fields, submit, run }) {
+function formModal({ title, icon, intro, fields, submit, run, cli }) {
   closeModal()
   const m = document.createElement('div')
   m.className = 'modal'
@@ -1552,14 +2157,16 @@ function formModal({ title, icon, intro, fields, submit, run }) {
   m.onclick = (e) => { if (e.target === m || e.target.closest('[data-x]')) closeModal() }
   const form = $('form', m)
   form.elements[fields[0].name].focus()
+  const values = () => Object.fromEntries(fields.map((f) => [f.name, f.type === 'password' ? form.elements[f.name].value : form.elements[f.name].value.trim()]))
+  if (cli) cliButton(m, () => cli(values()))
   form.onsubmit = async (e) => {
     e.preventDefault()
-    const v = Object.fromEntries(fields.map((f) => [f.name, f.type === 'password' ? form.elements[f.name].value : form.elements[f.name].value.trim()]))
+    const v = values()
     try { await run(v); closeModal(); window.refresh?.() } catch (err) { $('.merr', m).innerHTML = `<div class="err">${esc(err.message)}</div>` }
   }
 }
-const newVolume = () => formModal({ title: 'Create a volume', icon: 'database', fields: [{ name: 'name', label: 'Volume name', placeholder: 'my-data' }], submit: 'Create', run: (v) => api('volume.create', v.name).then(() => toast(`Created volume ${v.name}`)) })
-const newNetwork = () => formModal({ title: 'Create a network', icon: 'network', intro: 'Creates a bridge network. Leave the subnet empty to let Docker choose.', fields: [{ name: 'name', label: 'Network name', placeholder: 'my-net' }, { name: 'subnet', label: 'Subnet (optional)', placeholder: '10.20.0.0/24' }], submit: 'Create', run: (v) => api('network.create', v.name, v.subnet).then(() => toast(`Created network ${v.name}`)) })
+const newVolume = () => formModal({ title: 'Create a volume', icon: 'database', fields: [{ name: 'name', label: 'Volume name', placeholder: 'my-data' }], submit: 'Create', cli: (v) => `docker volume create ${shq(v.name)}`, run: (v) => api('volume.create', v.name).then(() => toast(`Created volume ${v.name}`)) })
+const newNetwork = () => formModal({ title: 'Create a network', icon: 'network', intro: 'Creates a bridge network. Leave the subnet empty to let Docker choose.', fields: [{ name: 'name', label: 'Network name', placeholder: 'my-net' }, { name: 'subnet', label: 'Subnet (optional)', placeholder: '10.20.0.0/24' }], submit: 'Create', cli: (v) => `docker network create${v.subnet ? ' --subnet ' + shq(v.subnet) : ''} ${shq(v.name)}`, run: (v) => api('network.create', v.name, v.subnet).then(() => toast(`Created network ${v.name}`)) })
 
 function showGMenu(btn, page, key) {
   const m = $('#menu')
@@ -1590,7 +2197,7 @@ async function volumes() {
   vList.sort((a, b) => volSize(b) - volSize(a) || a.Name.localeCompare(b.Name))
   for (const k of [...gsel.volumes]) if (!vList.some((v) => v.Name === k)) gsel.volumes.delete(k)
   const inUse = vList.filter((v) => v.usedBy.length).reduce((a, v) => a + volSize(v), 0)
-  return `<div class="head"><h2>${ic('database', 22)}Volumes<span class="count">${vList.length}</span></h2>
+  return `<div class="head"><h2>${ic('database', 22)}${tr('Volumes')}<span class="count">${vList.length}</span></h2>
     <div class="usage"><div><div class="k">${vList.length} volume${vList.length === 1 ? '' : 's'}</div><div class="v"><b>${fmt(inUse)}</b> / ${fmt(vList.reduce((a, v) => a + volSize(v), 0))}</div><div class="s">in use</div></div></div></div>
     <div class="tools">${searchBox('volumes')}${filterSelect('volumes')}<span class="sp"></span>
       ${tbtn('plus', 'Create volume', call('newvol'), 'pri')}${tbtn('broom', 'Prune unused', call('confirm', 'Remove ALL unused volumes? Their data will be lost.', 'volumes.prune'))}</div>
@@ -1619,7 +2226,7 @@ async function networks() {
   nList.sort((a, b) => SYSTEM_NETS.has(a.Name) - SYSTEM_NETS.has(b.Name) || a.Name.localeCompare(b.Name))
   for (const k of [...gsel.networks]) if (!nList.some((n) => n.Id === k)) gsel.networks.delete(k)
   const used = nList.filter((n) => Object.keys(n.Containers || {}).length).length
-  return `<div class="head"><h2>${ic('network', 22)}Networks<span class="count">${nList.length}</span></h2>
+  return `<div class="head"><h2>${ic('network', 22)}${tr('Networks')}<span class="count">${nList.length}</span></h2>
     <div class="usage"><div><div class="k">${nList.length} networks</div><div class="v"><b>${used}</b> / ${nList.length}</div><div class="s">in use</div></div></div></div>
     <div class="tools">${searchBox('networks')}${filterSelect('networks')}<span class="sp"></span>
       ${tbtn('plus', 'Create network', call('newnet'), 'pri')}${tbtn('broom', 'Prune unused', call('confirm', 'Remove unused networks?', 'networks.prune'))}</div>
@@ -1666,6 +2273,24 @@ function layersHtml(hist, obj) {
         <td class="mono lcmd" title="${esc(cmd)}">${esc(cmd.length > 240 ? cmd.slice(0, 240) + '…' : cmd)}${(l.Tags || []).length ? ` <span class="pill running">${esc(l.Tags.join(', '))}</span>` : ''}</td></tr>`
     }).join('')}</tbody></table>`
 }
+// Vulnerability scan tab: runs on demand (it can take a minute) with Trivy or Grype, whichever is installed.
+const SEV_ORDER = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'UNKNOWN']
+const scanCache = new Map() // image id -> last result, so reopening the tab doesn't rescan
+async function vulnTab(pane, id) {
+  const draw = (r, filter = 'ALL') => {
+    const rows = r.items.filter((i) => filter === 'ALL' || i.severity === filter)
+    pane.innerHTML = `<div class="vsum">${SEV_ORDER.map((k) => `<button type="button" class="vchip sev-${k.toLowerCase()} ${filter === k ? 'on' : ''}" data-sev="${k}"><b>${r.counts[k]}</b> ${k.toLowerCase()}</button>`).join('')}
+        <span class="sp"></span><span class="meta">${esc(r.tool)} · ${r.total} found</span>${tbtn('restart', 'Rescan', call('rescan'))}</div>
+      ${rows.length ? `<table class="vtable"><thead><tr><th>Severity</th><th>CVE</th><th>Package</th><th>Installed</th><th>Fixed in</th></tr></thead><tbody>${rows.slice(0, 500).map((i) => `<tr title="${esc(i.title)}"><td><span class="vchip sev-${i.severity.toLowerCase()}">${i.severity.toLowerCase()}</span></td><td class="mono nw">${esc(i.id)}</td><td class="mono">${esc(i.pkg)}</td><td class="mono meta">${esc(i.version)}</td><td class="mono">${esc(i.fixed) || '<span class="meta">no fix yet</span>'}</td></tr>`).join('')}</tbody></table>${rows.length > 500 ? `<div class="meta">Showing the first 500 of ${rows.length}.</div>` : ''}` : `<div class="allgood">${ic('info', 18)}<div><b>${r.total ? 'Nothing at this level' : 'No known vulnerabilities'}</b></div></div>`}`
+    pane.querySelectorAll('[data-sev]').forEach((b) => (b.onclick = () => draw(r, filter === b.dataset.sev ? 'ALL' : b.dataset.sev)))
+    pane.querySelector('[data-call]').onclick = (e) => { e.stopPropagation(); scanCache.delete(id); start() }
+  }
+  const start = async () => {
+    pane.innerHTML = `<div class="meta" style="padding:16px">Scanning… this can take a minute the first time (the scanner downloads its vulnerability database).</div>`
+    try { const r = await api('image.scan', id); scanCache.set(id, r); if (pane.isConnected) draw(r) } catch (e) { if (pane.isConnected) pane.innerHTML = `<div class="err" style="margin:16px">${esc(e.message)}</div>` }
+  }
+  scanCache.has(id) ? draw(scanCache.get(id)) : start()
+}
 async function openImageDetail(id, title, first = 'Layers') {
   closeDetail()
   let obj, hist
@@ -1673,14 +2298,14 @@ async function openImageDetail(id, title, first = 'Layers') {
   const d = document.createElement('div')
   d.className = 'detail'
   d.innerHTML = `<header>${ic('image', 18)}<b>${esc(title)}</b><span class="meta mono">${esc(short(obj.Id))}</span><button class="ib" id="x" title="Close">${ic('x')}</button></header>
-    <div class="tabs">${[['Layers', 'layers'], ['Inspect', 'box']].map(([t, i]) => `<a data-t="${t}">${ic(i, 14)}${t}</a>`).join('')}</div><div class="pane"></div>`
+    <div class="tabs">${[['Layers', 'layers'], ['Vulnerabilities', 'info'], ['Inspect', 'box']].map(([t, i]) => `<a data-t="${t}">${ic(i, 14)}${t}</a>`).join('')}</div><div class="pane"></div>`
   document.body.append(d)
   $('#x', d).onclick = closeDetail
   const pane = $('.pane', d)
   const tab = (t) => {
     d.querySelectorAll('.tabs a').forEach((a) => a.classList.toggle('on', a.dataset.t === t))
     pane.className = 'pane'; pane.innerHTML = ''
-    t === 'Layers' ? (pane.innerHTML = layersHtml(hist, obj)) : jsonViewer(pane, obj, 'image')
+    t === 'Layers' ? (pane.innerHTML = layersHtml(hist, obj)) : t === 'Vulnerabilities' ? vulnTab(pane, id) : jsonViewer(pane, obj, 'image')
   }
   d.querySelector('.tabs').onclick = (e) => { const t = e.target.closest('[data-t]')?.dataset.t; if (t) tab(t) }
   tab(first)
@@ -1792,9 +2417,22 @@ function filesTab(pane, info) {
       <div class="meta">${fmt(r.size)}${r.truncated ? ' · showing the first 256 kB' : ''}${lines.length > 5000 ? ' · showing the first 5,000 lines' : ''}</div>
       ${r.binary ? `<div class="empty small">${ic('box', 26)}<div>Binary file. Download it to open it.</div></div>`
         : `<div class="jcode pvcode">${shown.map((l, i) => `<div class="jl"><span class="jno">${i + 1}</span><span class="jt">${esc(l)}</span></div>`).join('')}</div>`}
-      <div class="row"><a class="tb" href="${dl('file', p)}" download>${ic('download', 14)}<span>Download</span></a><button type="button" class="tb" id="pvc">Close</button></div></div>`
+      <div class="row"><a class="tb" href="${dl('file', p)}" download>${ic('download', 14)}<span>Download</span></a><span class="sp"></span>${r.binary || r.truncated || lines.length > 5000 ? '' : `<button type="button" class="tb" id="pve">${ic('logs', 14)}<span>Edit</span></button>`}<button type="button" class="tb" id="pvc">Close</button></div></div>`
     document.body.append(m)
     $('#pvc', m).onclick = closeModal
+    if ($('#pve', m)) $('#pve', m).onclick = () => {
+      const ta = document.createElement('textarea')
+      ta.className = 'yaml'; ta.spellcheck = false; ta.value = r.text; ta.setAttribute('wrap', 'off')
+      ta.addEventListener('keydown', (e) => { if (e.key === 'Tab') { e.preventDefault(); document.execCommand('insertText', false, '  ') } })
+      $('.pvcode', m).replaceWith(ta)
+      const row = $('.row', m)
+      row.innerHTML = `<span class="meta">Saved straight into the container's filesystem. It is lost if the container is recreated.</span><span class="sp"></span><button type="button" class="tb" id="pvcancel">Cancel</button><button type="button" class="tb pri" id="pvsave">${ic('copy', 14)}<span>Save</span></button>`
+      ta.focus()
+      $('#pvcancel', m).onclick = () => preview(p)
+      $('#pvsave', m).onclick = async () => {
+        try { await api('container.write', id, p, ta.value); toast('Saved'); preview(p); load(cwd) } catch (err) { toast(err.message, true) }
+      }
+    }
     m.onclick = (e) => { if (e.target === m) closeModal() }
   }
   list.onclick = async (e) => {
@@ -1847,6 +2485,14 @@ function containerSettings(pane, info) {
     toast('Recreating the container…')
     try { const r = await api('container.removeLimits', info.Id, what); toast('Limit removed'); window.refresh?.(); openDetail(r.id, 'Settings') } catch (err) { toast(err.message, true) }
   }
+  cliButton(null, () => {
+    const old = info.Name.replace(/^\//, ''), nn = $('#cs-name', pane).value.trim(), mem = Number($('#cs-mem', pane).value) || 0, cpus = Number($('#cs-cpu', pane).value) || 0
+    const u = ['docker update', '--restart', $('#cs-restart', pane).value]
+    if (mem) u.push('--memory', `${mem}m`, '--memory-swap', `${mem * 2}m`)
+    if (cpus) u.push('--cpus', String(cpus))
+    u.push(shq(old))
+    return [u.join(' '), nn && nn !== old ? `docker rename ${shq(old)} ${shq(nn)}` : ''].filter(Boolean).join(' && ')
+  }, { after: $('#cs-save', pane) })
   if ($('#cs-nomem', pane)) $('#cs-nomem', pane).onclick = () => removeLimit({ memory: true }, 'memory')
   if ($('#cs-nocpu', pane)) $('#cs-nocpu', pane).onclick = () => removeLimit({ cpus: true }, 'CPU')
   $('.cform', pane).onsubmit = async (e) => {
@@ -2182,6 +2828,11 @@ document.addEventListener('keydown', (e) => { if (e.key === 'Escape') hideMenu()
 const [startPage, startId] = START.split('/')
 nav(); renderStatus()
 go(PAGES[startPage] ? startPage : 'dashboard')
+document.documentElement.lang = langCode()
 checkDaemon(); refreshInfo(); refreshStats(); startEvents(); loadHistory()
+setTimeout(() => { // the daily update check is opt-in
+  let last = 0; try { last = Number(localStorage.getItem('lastUpdateCheck')) || 0 } catch {}
+  if (settings.autoUpdate && Date.now() - last > 24 * 3600 * 1000) checkForUpdate({ silent: true })
+}, 8000)
 if (startId) openDetail(startId, 'Overview') // deep link: #containers/<id or name>
 if (startPage === 'shell') openTerm('shell') // deep link: #shell

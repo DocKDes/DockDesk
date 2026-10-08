@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url'
 
 const dir = dirname(fileURLToPath(import.meta.url))
 const want = process.argv.slice(2)
-const order = ['package', 'security', 'api', 'ui', 'registry']
+const order = ['package', 'i18n', 'security', 'api', 'ui', 'registry']
 const LIMIT = Number(process.env.DD_TEST_FILE_TIMEOUT_MS) || 10 * 60 * 1000
 const files = readdirSync(dir).filter((f) => f.endsWith('.test.mjs') && (!want.length || want.some((w) => f.startsWith(w))))
   .sort((a, b) => order.findIndex((o) => a.startsWith(o)) - order.findIndex((o) => b.startsWith(o)))

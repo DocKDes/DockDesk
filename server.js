@@ -49,12 +49,117 @@ async function dk(method, url, body) {
   try { return text ? JSON.parse(text) : null } catch { return text }
 }
 
+const runQuiet = (cmd, args) =>
+  new Promise((resolve, reject) =>
+    execFile(cmd, args, { maxBuffer: 256 << 20, timeout: 15 * 60 * 1000 }, (err, out, e2) =>
+      err ? reject(new Error((e2 || err.message).trim().split('\n').slice(-3).join(' '))) : resolve(out)
+    )
+  )
+
 const run = (cmd, args, cwd) =>
   new Promise((resolve, reject) =>
     execFile(cmd, args, { cwd, maxBuffer: 16 << 20 }, (err, out, e2) =>
       err ? reject(new Error((e2 || err.message).trim())) : resolve(out + e2)
     )
   )
+
+// ---------- App info, update check, settings file, system tray ----------
+const APP = (() => { try { return JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8')) } catch { return {} } })()
+const VERSION = APP.version || 'unknown'
+const RELEASES_URL = 'https://github.com/DocKDes/DockDesk/releases/latest'
+const UPDATE_URL = process.env.DOCKDESK_UPDATE_URL || 'https://registry.npmjs.org/dockdesk/latest' // overridable for tests
+function installKind() {
+  if (__dirname.includes(`${path.sep}node_modules${path.sep}`)) return 'npm'
+  if (__dirname === '/opt/dockdesk') return 'deb'
+  if (__dirname === path.join(os.homedir(), '.local', 'share', 'dockdesk')) return 'script'
+  return 'source'
+}
+// Is version a newer than b? (numeric major.minor.patch; a pre-release suffix is ignored)
+function isNewer(a, b) {
+  const v = (x) => String(x).split(/[-+]/)[0].split('.').map((n) => parseInt(n, 10) || 0)
+  const x = v(a), y = v(b)
+  for (let i = 0; i < 3; i++) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) > (y[i] || 0)
+  return false
+}
+function fetchJson(url, ms = 8000) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url)
+    if (u.protocol !== 'https:' && !(process.env.DOCKDESK_UPDATE_URL && u.protocol === 'http:')) return reject(new Error('Update check needs an https address'))
+    const req = (u.protocol === 'https:' ? require('node:https') : http).get(u, { headers: { 'User-Agent': `DockDesk/${VERSION}`, Accept: 'application/json' }, timeout: ms }, (res) => {
+      if (res.statusCode !== 200) { res.resume(); return reject(new Error(`The update server answered ${res.statusCode}`)) }
+      let b = ''
+      res.setEncoding('utf8')
+      res.on('data', (c) => { b += c; if (b.length > 200000) req.destroy(new Error('The update answer was too large')) })
+      res.on('end', () => { try { resolve(JSON.parse(b)) } catch { reject(new Error('Unexpected answer from the update server')) } })
+    })
+    req.on('timeout', () => req.destroy(new Error('The update server did not answer in time')))
+    req.on('error', (e) => reject(new Error(/ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ENETUNREACH|EHOSTUNREACH/.test(e.code || e.message) ? 'Could not reach the update server. Are you online?' : e.message)))
+  })
+}
+
+// Settings that must live on the server (it needs them before any window exists): ~/.config/dockdesk/config.json
+const CONFIG_DIR = path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'dockdesk')
+const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json')
+const readConfig = () => { try { const j = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); return j && typeof j === 'object' && !Array.isArray(j) ? j : {} } catch { return {} } }
+function writeConfig(c) {
+  fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 })
+  fs.writeFileSync(CONFIG_FILE, JSON.stringify(c, null, 2), { mode: 0o600 })
+}
+
+// The tray icon is a small Python/GTK helper (tray.py) that talks to us over stdin/stdout, so nothing is exposed on the network
+// and the token never leaves this process. We send it { engine, running, total } lines; it prints one action word per line.
+const TRAY_PROBE = "import gi\ngi.require_version('Gtk','3.0')\ntry:\n    gi.require_version('AyatanaAppIndicator3','0.1')\nexcept ValueError:\n    gi.require_version('AppIndicator3','0.1')\nfrom gi.repository import Gtk"
+let trayProbe
+const trayAvailable = () => (trayProbe ||= process.env.DOCKDESK_TRAY_CMD ? Promise.resolve(true)
+  : !(process.env.DISPLAY || process.env.WAYLAND_DISPLAY) ? Promise.resolve(false)
+  : run('python3', ['-c', TRAY_PROBE]).then(() => true, () => false))
+function trayHint() {
+  let rel = {}
+  try { for (const l of fs.readFileSync('/etc/os-release', 'utf8').split('\n')) { const m = /^(\w+)=(.*)$/.exec(l); if (m) rel[m[1]] = m[2].replace(/^"|"$/g, '') } } catch {}
+  const id = `${rel.ID || ''} ${rel.ID_LIKE || ''}`
+  if (/debian|ubuntu|kali/.test(id)) return 'sudo apt install python3-gi gir1.2-ayatanaappindicator3-0.1'
+  if (/fedora|rhel|centos/.test(id)) return 'sudo dnf install python3-gobject libayatana-appindicator-gtk3'
+  if (/arch/.test(id)) return 'sudo pacman -S python-gobject libayatana-appindicator'
+  return ''
+}
+let trayProc = null, trayTimer = null, appUrl = ''
+const appAlive = () => !!appWindow && appWindow.exitCode === null
+const notify = (msg) => execFile('notify-send', ['-a', 'DockDesk', 'DockDesk', String(msg).slice(0, 300)], () => {})
+async function pushTray() {
+  if (!trayProc) return
+  let m = { engine: false, running: 0, total: 0 }
+  try { const i = await dk('GET', '/info'); m = { engine: true, running: i.ContainersRunning || 0, total: i.Containers || 0 } } catch {}
+  try { trayProc.stdin.write(JSON.stringify(m) + '\n') } catch {}
+}
+function trayAction(a) {
+  const done = (what) => (r) => { pushTray(); if (r instanceof Error) notify(r.message); else if (what) notify(what) }
+  if (a === 'show') { if (!process.env.DOCKDESK_NO_OPEN && !appAlive() && appUrl) openApp(appUrl) }
+  else if (a === 'engine-start') engineCtl('start').then(done('Docker started'), done())
+  else if (a === 'engine-stop') engineCtl('stop').then(done('Docker stopped'), done())
+  else if (a === 'stop-all') dk('GET', '/containers/json').then((l) => Promise.all(l.map((c) => dk('POST', `/containers/${c.Id}/stop`).catch(() => {})))).then(done(`Stopped all containers`), done())
+  else if (a === 'quit') process.exit(0)
+}
+function startTray() {
+  if (trayProc) return
+  const cmd = process.env.DOCKDESK_TRAY_CMD
+  const proc = spawn(cmd || 'python3', cmd ? [PUBLIC] : [path.join(__dirname, 'tray.py'), PUBLIC], { stdio: ['pipe', 'pipe', 'ignore'] })
+  trayProc = proc
+  let buf = ''
+  proc.stdout.setEncoding('utf8')
+  proc.stdout.on('data', (c) => { buf += c; let i; while ((i = buf.indexOf('\n')) >= 0) { const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1); trayAction(line) } })
+  proc.stdin.on('error', () => {})
+  const gone = () => {
+    if (trayProc !== proc) return // switched off on purpose
+    trayProc = null; clearInterval(trayTimer)
+    if (!process.env.DOCKDESK_NO_OPEN && !appAlive()) process.exit(0) // no window and no tray left: nothing to keep running for
+  }
+  proc.on('error', gone); proc.on('exit', gone)
+  pushTray(); trayTimer = setInterval(pushTray, 5000)
+}
+function stopTray() {
+  const p = trayProc; trayProc = null; clearInterval(trayTimer)
+  try { p?.kill('SIGTERM') } catch {}
+}
 
 // Start/stop the engine. Try without a prompt first (works when the optional polkit rule is installed),
 // and fall back to pkexec, which shows the system password dialog.
@@ -94,6 +199,18 @@ async function composeFileAllowed(file) {
   if ((f + path.sep).startsWith(root)) return true
   const cs = await dk('GET', '/containers/json?all=1')
   return cs.some((c) => String(c.Labels?.['com.docker.compose.project.config_files'] || '').split(',').some((x) => x && realOr(x) === f))
+}
+const SERVICE_NAME = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$/
+const PROFILE_NAME = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$/
+const profileArgs = (list) => (Array.isArray(list) ? list : []).slice(0, 20).flatMap((x) => { if (!PROFILE_NAME.test(String(x))) throw new Error('Invalid profile name'); return ['--profile', String(x)] })
+// "-f a.yml -f b.yml" for a comma separated list of compose files, refusing files that are not part of a project DockDesk may touch
+async function composeFileArgs(files) {
+  const out = []
+  for (const f of String(files || '').split(',').filter(Boolean)) {
+    if (!(await composeFileAllowed(f))) throw new Error('That compose file is not one DockDesk may use')
+    out.push('-f', f)
+  }
+  return out
 }
 function composeRun(args, stdin, cwd, ms = 30000) {
   return new Promise((resolve) => {
@@ -197,7 +314,8 @@ async function* tarEntry(r) {
         const size = parseInt(h.subarray(124, 136).toString().replace(/\0[\s\S]*$/, '').trim() || '0', 8) || 0
         const name = h.subarray(0, 100).toString().replace(/\0[\s\S]*$/, '')
         if ('xgLK'.includes(type)) { mode = 'skip'; skip = Math.ceil(size / 512) * 512; continue }
-        yield { meta: { name, size, type } }
+        const cs = (b) => b.toString('utf8').replace(/\0[\s\S]*$/, ''), oc = (b) => parseInt(cs(b).trim() || '0', 8) || 0
+        yield { meta: { name, size, type, mode: oc(h.subarray(100, 108)), uid: oc(h.subarray(108, 116)), gid: oc(h.subarray(116, 124)), uname: cs(h.subarray(265, 297)), gname: cs(h.subarray(297, 329)) } }
         if (type !== '0' || !size) return
         remaining = size; mode = 'data'
       } else if (mode === 'skip') {
@@ -298,11 +416,13 @@ async function archiveList(id, p) {
   return { path: p, entries, source: 'archive', partial }
 }
 
-function tarHeader(name, size) {
-  const b = Buffer.alloc(512)
-  b.write(name, 0, 100, 'utf8'); b.write('0000644\0', 100); b.write('0000000\0', 108); b.write('0000000\0', 116)
+function tarHeader(name, size, o = {}) {
+  const b = Buffer.alloc(512), oct = (n, w) => (Math.max(0, n | 0) & 0o7777777).toString(8).padStart(w - 1, '0') + '\0'
+  b.write(name, 0, 100, 'utf8'); b.write(oct(o.mode ?? 0o644, 8), 100); b.write(oct(o.uid ?? 0, 8), 108); b.write(oct(o.gid ?? 0, 8), 116)
   b.write(size.toString(8).padStart(11, '0') + '\0', 124); b.write(Math.floor(Date.now() / 1000).toString(8).padStart(11, '0') + '\0', 136)
   b.write('        ', 148); b.write('0', 156); b.write('ustar\0', 257); b.write('00', 263)
+  if (o.uname) b.write(String(o.uname).slice(0, 31), 265, 32, 'utf8')
+  if (o.gname) b.write(String(o.gname).slice(0, 31), 297, 32, 'utf8')
   let sum = 0; for (const x of b) sum += x
   b.write(sum.toString(8).padStart(6, '0') + '\0 ', 148)
   return b
@@ -449,6 +569,47 @@ const handlers = {
     return run('docker', ['logout', ...(server ? [server] : [])])
   },
   'image.history': (id) => dk('GET', `/images/${seg(id)}/history`),
+  // Is a newer version of this tag in the registry? Asks the daemon (it uses your registry login) for the tag's current digest
+  // and compares it with the digests of the local copy. { update: null } means it could not tell (e.g. a locally built image).
+  'image.update.check': async (ref) => {
+    ref = String(ref || '')
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9._:\/-]{0,255}$/.test(ref) || /^(sha256:)?[a-f0-9]{12,64}$/.test(ref)) return { update: null }
+    try {
+      const img = await dk('GET', `/images/${seg(ref)}/json`)
+      const local = (img.RepoDigests || []).map((d) => d.split('@')[1])
+      if (!local.length) return { update: null, reason: 'built or loaded locally' }
+      const d = await dk('GET', `/distribution/${ref.split('/').map(enc).join('/')}/json`)
+      const remote = d.Descriptor?.digest
+      if (!remote) return { update: null }
+      return { update: !local.includes(remote), remote }
+    } catch (e) { return { update: null, reason: e.message } }
+  },
+  // Vulnerability scan with Trivy or Grype, whichever is installed (neither is bundled). Output is normalised to one shape.
+  'scan.tool': async () => {
+    for (const t of ['trivy', 'grype']) { try { await run(t, ['--version']); return t } catch {} }
+    return null
+  },
+  'image.scan': async (ref) => {
+    ref = String(ref || '')
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9._:\/@-]{0,255}$/.test(ref)) throw new Error('Invalid image reference')
+    const tool = await handlers['scan.tool']()
+    if (!tool) throw new Error('Install Trivy or Grype to scan images (for example: sudo apt install trivy)')
+    const SEV = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'UNKNOWN']
+    const norm = (x) => (SEV.includes(String(x || '').toUpperCase()) ? String(x).toUpperCase() : 'UNKNOWN')
+    const items = []
+    if (tool === 'trivy') {
+      const j = JSON.parse(await runQuiet('trivy', ['image', '--quiet', '--format', 'json', '--scanners', 'vuln', ref]))
+      for (const r of j.Results || []) for (const v of r.Vulnerabilities || [])
+        items.push({ id: v.VulnerabilityID, pkg: v.PkgName, version: v.InstalledVersion, fixed: v.FixedVersion || '', severity: norm(v.Severity), title: v.Title || '', target: r.Target })
+    } else {
+      const j = JSON.parse(await runQuiet('grype', [ref, '-o', 'json', '-q']))
+      for (const m of j.matches || [])
+        items.push({ id: m.vulnerability.id, pkg: m.artifact.name, version: m.artifact.version, fixed: (m.vulnerability.fix?.versions || []).join(', '), severity: norm(m.vulnerability.severity), title: m.vulnerability.description || '', target: m.artifact.type || '' })
+    }
+    items.sort((a, b) => SEV.indexOf(a.severity) - SEV.indexOf(b.severity) || a.pkg.localeCompare(b.pkg))
+    const counts = Object.fromEntries(SEV.map((k) => [k, items.filter((i) => i.severity === k).length]))
+    return { tool, counts, total: items.length, items: items.slice(0, 2000).map((i) => ({ ...i, title: i.title.slice(0, 300) })) }
+  },
   'image.inspect': (id) => dk('GET', `/images/${seg(id)}/json`),
   'image.remove': (id, force) => dk('DELETE', `/images/${seg(id)}?force=${!!force}`),
   'images.prune': (all) => dk('POST', `/images/prune?filters=${filters({ dangling: [all ? 'false' : 'true'] })}`),
@@ -478,13 +639,114 @@ const handlers = {
   },
   'network.remove': (id) => dk('DELETE', `/networks/${seg(id)}`),
   'networks.prune': () => dk('POST', '/networks/prune'),
+  'builds.prune': () => dk('POST', '/build/prune?all=true'),
+  // Everything unused in one go: stopped containers, unused images, unused volumes and networks, and the build cache.
+  'system.prune': async () => {
+    const r = { containers: await dk('POST', '/containers/prune'), images: await dk('POST', `/images/prune?filters=${filters({ dangling: ['false'] })}`) }
+    r.networks = await dk('POST', '/networks/prune')
+    r.volumes = await dk('POST', `/volumes/prune?filters=${filters({ all: ['true'] })}`)
+    r.builds = await dk('POST', '/build/prune?all=true')
+    const reclaimed = (r.containers?.SpaceReclaimed || 0) + (r.images?.SpaceReclaimed || 0) + (r.volumes?.SpaceReclaimed || 0) + (r.builds?.SpaceReclaimed || 0)
+    return { reclaimed }
+  },
 
-  'compose.action': (project, workdir, files, action) => {
-    const verbs = { up: ['up', '-d'], down: ['down'], stop: ['stop'], start: ['start'], restart: ['restart'] }
+  // profiles: optional list of compose profile names to enable (`docker compose --profile x up`)
+  'compose.action': async (project, workdir, files, action, profiles) => {
+    const verbs = { up: ['up', '-d'], down: ['down'], stop: ['stop'], start: ['start'], restart: ['restart'], pull: ['pull'], build: ['build'] }
     if (!verbs[action]) throw new Error('bad action')
-    const args = ['compose', '-p', project]
-    for (const f of (files || '').split(',').filter(Boolean)) args.push('-f', f)
+    const args = ['compose', '-p', project, ...(await composeFileArgs(files)), ...profileArgs(profiles)]
     return run('docker', [...args, ...verbs[action]], workdir || undefined).catch((e) => { throw new Error(friendlyCompose(e.message)) })
+  },
+  // One service of a project: restart, stop, start, pull, build, or scale to n containers.
+  'compose.service': async (project, workdir, files, service, action, n) => {
+    if (!/^[a-z0-9][a-z0-9_-]{0,62}$/.test(String(project))) throw new Error('Invalid project name')
+    if (!SERVICE_NAME.test(String(service))) throw new Error('Invalid service name')
+    const verbs = { restart: ['restart'], stop: ['stop'], start: ['start'], pull: ['pull'], build: ['build'] }
+    let tail
+    if (action === 'scale') {
+      n = Number(n)
+      if (!Number.isInteger(n) || n < 0 || n > 50) throw new Error('Scale must be a whole number from 0 to 50')
+      tail = ['up', '-d', '--no-recreate', '--scale', `${service}=${n}`, service]
+    } else if (verbs[action]) tail = [...verbs[action], service]
+    else throw new Error('bad action')
+    const args = ['compose', '-p', project, ...(await composeFileArgs(files))]
+    return run('docker', [...args, ...tail], workdir && path.isAbsolute(workdir) ? workdir : undefined).catch((e) => { throw new Error(friendlyCompose(e.message)) })
+  },
+  // Profiles declared in a compose file.
+  'compose.profiles': async (file) => {
+    if (!(await composeFileAllowed(file))) throw new Error('That compose file is not one DockDesk may use')
+    const r = await composeRun(['-f', file, 'config', '--profiles'], '', path.dirname(file))
+    if (r.code !== 0) return []
+    return r.out.split('\n').map((x) => x.trim()).filter(Boolean)
+  },
+  // Service dependency graph: services, their depends_on and profiles (never returns environment values).
+  'compose.graph': async (file) => {
+    if (!(await composeFileAllowed(file))) throw new Error('That compose file is not one DockDesk may use')
+    let r = await composeRun(['-f', file, '--profile', '*', 'config', '--format', 'json'], '', path.dirname(file))
+    if (r.code !== 0) r = await composeRun(['-f', file, 'config', '--format', 'json'], '', path.dirname(file)) // older compose has no --profile '*'
+    if (r.code !== 0) throw new Error(friendlyCompose(r.err.trim()).split('\n').filter((l) => !/level=warning/.test(l)).join('\n') || 'Could not read the compose file')
+    let j; try { j = JSON.parse(r.out) } catch { throw new Error('Could not read the compose file') }
+    return Object.entries(j.services || {}).map(([name, v]) => ({ name, image: v.image || (v.build ? 'build' : ''), profiles: v.profiles || [], depends: Object.keys(v.depends_on || {}) }))
+  },
+  // The .env file next to a compose file (variables for ${…} in it).
+  'compose.env.read': async (file) => {
+    if (!(await composeFileAllowed(file))) throw new Error('That compose file is not one DockDesk may use')
+    const f = path.join(path.dirname(file), '.env')
+    try {
+      const st = fs.statSync(f)
+      if (!st.isFile() || st.size > 256 * 1024) throw new Error('.env is not a regular file or is too large')
+      let writable = true; try { fs.accessSync(f, fs.constants.W_OK) } catch { writable = false }
+      return { file: f, exists: true, text: fs.readFileSync(f, 'utf8'), writable }
+    } catch (e) {
+      if (e.code === 'ENOENT') return { file: f, exists: false, text: '', writable: true }
+      throw e
+    }
+  },
+  'compose.env.write': async (file, text) => {
+    if (!(await composeFileAllowed(file))) throw new Error('That compose file is not one DockDesk may use')
+    text = String(text ?? '')
+    if (text.length > 256 * 1024 || text.includes('\0')) throw new Error('.env is too large or not text')
+    const f = path.join(path.dirname(file), '.env')
+    if (fs.existsSync(f)) { fs.copyFileSync(f, f + '.dockdesk.bak'); fs.writeFileSync(f, text) } // keep the file's own permissions
+    else fs.writeFileSync(f, text, { mode: 0o600 }) // new .env files usually hold secrets
+    return 'ok'
+  },
+  // Which of these host ports can't be used? Checks Docker's own published ports and tries to bind on this machine.
+  'ports.check': async (list) => {
+    const net = require('node:net')
+    const ports = [...new Set((Array.isArray(list) ? list : []).map(Number).filter((n) => Number.isInteger(n) && n > 0 && n < 65536))].slice(0, 64)
+    const used = new Map()
+    for (const c of await dk('GET', '/containers/json')) for (const pt of c.Ports || []) if (pt.PublicPort) used.set(pt.PublicPort, (c.Names?.[0] || c.Id.slice(0, 12)).replace(/^\//, ''))
+    const out = {}
+    await Promise.all(ports.map((n) => new Promise((resolve) => {
+      if (used.has(n)) { out[n] = used.get(n); return resolve() }
+      const srv = net.createServer()
+      srv.once('error', (e) => { if (e.code === 'EADDRINUSE') out[n] = 'another program'; resolve() })
+      srv.listen(n, '127.0.0.1', () => srv.close(() => resolve()))
+    })))
+    return out // port -> who has it
+  },
+  // Save edited text over a file in a container, keeping its permissions and owner.
+  'container.write': async (id, p, text) => {
+    id = cid(id); p = cpath(p); text = String(text ?? '')
+    const data = Buffer.from(text, 'utf8')
+    if (data.length > 256 * 1024) throw new Error('Only files up to 256 kB can be edited here')
+    const base = path.posix.basename(p), dir = path.posix.dirname(p)
+    if (!base || base === '.' || base === '..' || p.endsWith('/')) throw new Error('Invalid file path')
+    let meta = { mode: 0o644, uid: 0, gid: 0 }
+    const r = await archiveReq(id, p)
+    for await (const part of tarEntry(r)) {
+      if (part.meta) { if (part.meta.type !== '0') { r.destroy(); throw new Error('That is not a regular file') } meta = part.meta; r.destroy(); break }
+    }
+    const pad = Buffer.alloc(((512 - (data.length % 512)) % 512) + 1024)
+    return new Promise((resolve, reject) => {
+      const dreq = http.request({ socketPath: SOCK, method: 'PUT', path: `/containers/${seg(id)}/archive?path=${enc(dir)}`, headers: { 'Content-Type': 'application/x-tar' } }, async (rr) => {
+        const body = await readBodyText(rr)
+        if (rr.statusCode >= 400) { let m = ''; try { m = JSON.parse(body).message } catch {} reject(new Error(m || `Docker API ${rr.statusCode}`)) } else resolve('ok')
+      })
+      dreq.on('error', reject)
+      dreq.end(Buffer.concat([tarHeader(base, data.length, { mode: meta.mode & 0o7777, uid: meta.uid, gid: meta.gid, uname: meta.uname, gname: meta.gname }), data, pad]))
+    })
   },
   // Open a local service in the default browser (loopback http only).
   'open.url': (url) => {
@@ -672,6 +934,25 @@ const handlers = {
     try { await dk('DELETE', `/containers/${info.Id}?force=true`) } catch (e) { throw new Error(`The container was recreated without the limit, but the old copy "${tmp}" could not be removed: ${e.message}`) }
     return { id: created.Id }
   },
+  'app.info': () => ({ version: VERSION, install: installKind() }),
+  // Asks the npm registry for the newest published version. Only runs when you press the button (or the daily check is on).
+  'update.check': async () => {
+    const j = await fetchJson(UPDATE_URL)
+    const latest = String(j.version || '')
+    if (!/^\d+\.\d+\.\d+/.test(latest)) throw new Error('Unexpected answer from the update server')
+    return { current: VERSION, latest, newer: isNewer(latest, VERSION), install: installKind() }
+  },
+  'open.release': () => run('xdg-open', [RELEASES_URL]),
+  'tray.status': async () => ({ available: await trayAvailable(), enabled: !!trayProc, hint: trayHint() }),
+  'tray.set': async (on) => {
+    if (typeof on !== 'boolean') throw new Error('Invalid request')
+    if (on) {
+      if (!(await trayAvailable())) throw new Error('A tray icon needs a desktop session with python3-gi and an AppIndicator library')
+      startTray()
+    } else stopTray()
+    writeConfig({ ...readConfig(), tray: on })
+    return { enabled: on }
+  },
   'daemon.start': () => engineCtl('start'),
   'daemon.stop': () => engineCtl('stop'),
   // Text of the optional polkit rule that removes the password prompt (shown in Settings).
@@ -791,9 +1072,9 @@ async function stream(kind, q, req, res) {
       const project = String(q.project || ''), file = String(q.file || ''), verb = String(q.verb || '')
       if (!PROJECT_NAME.test(project)) throw new Error('Invalid project name')
       if (!(await composeFileAllowed(file))) throw new Error('That compose file is not one DockDesk may use')
-      const verbs = { up: ['up', '-d'], down: ['down'], pull: ['pull'], restart: ['restart'], stop: ['stop'] }
+      const verbs = { up: ['up', '-d'], down: ['down'], pull: ['pull'], restart: ['restart'], stop: ['stop'], build: ['build'] }
       if (!verbs[verb]) throw new Error('Unknown action')
-      const proc = spawn('docker', ['compose', '--progress=plain', '-p', project, '-f', file, ...verbs[verb]], { cwd: path.dirname(file), stdio: ['ignore', 'pipe', 'pipe'] })
+      const proc = spawn('docker', ['compose', '--progress=plain', '-p', project, '-f', file, ...profileArgs(String(q.profiles || '').split(',').filter(Boolean)), ...verbs[verb]], { cwd: path.dirname(file), stdio: ['ignore', 'pipe', 'pipe'] })
       const d1 = new StringDecoder('utf8'), d2 = new StringDecoder('utf8')
       let seen = ''
       proc.stdout.on('data', (c) => send('data', d1.write(c)))
@@ -1010,6 +1291,8 @@ server.listen(PORT, '127.0.0.1', () => {
   // The token must never appear on a command line (readable by every local user via /proc),
   // so only print it when a human is driving this from a terminal, or in headless mode.
   if (process.env.DOCKDESK_NO_OPEN || process.stdout.isTTY) console.log(url)
+  appUrl = url
+  if (readConfig().tray && (!process.env.DOCKDESK_NO_OPEN || process.env.DOCKDESK_TRAY_CMD)) trayAvailable().then((ok) => ok && startTray())
   if (process.env.DOCKDESK_NO_OPEN) return
   // Restarted by the old copy (see app.relaunch): wait for it to exit first, otherwise the browser hands this window to the old browser process and returns at once
   const old = Number(process.env.DOCKDESK_WAIT_PID) || 0
@@ -1044,7 +1327,8 @@ function openApp(url) {
     const child = appWindow = execFile(browsers[i], [`--app=${target}`, '--class=DockDesk', '--no-first-run', `--user-data-dir=${profile}`], () => {})
     child.on('error', () => tryNext(i + 1))
     // When the app window closes, shut the server down so nothing lingers in the background.
-    child.on('exit', (code) => { if (code === 0 || code === null) process.exit(0) })
+    // With the tray icon on, the server keeps running in the tray instead, and the tray's Open entry brings the window back.
+    child.on('exit', (code) => { if (code === 0 || code === null) { appWindow = null; if (!trayProc) process.exit(0) } })
   }
   tryNext(0)
 }

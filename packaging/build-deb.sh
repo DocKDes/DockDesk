@@ -5,7 +5,7 @@ cd "$(dirname "$0")/.."
 VER=$(node -p "require('./package.json').version")
 R=dist/pkg
 rm -rf "$R" && mkdir -p "$R/usr/share/doc/dockdesk" "$R/DEBIAN" "$R/opt/dockdesk" "$R/usr/bin" "$R/usr/share/applications" "$R/usr/share/icons/hicolor/256x256/apps"
-cp -r server.js pty-shell.py dockdesk-polkit.rules public "$R/opt/dockdesk/"
+cp -r server.js pty-shell.py tray.py package.json dockdesk-polkit.rules public "$R/opt/dockdesk/"
 cp public/icon.png "$R/usr/share/icons/hicolor/256x256/apps/dockdesk.png"
 cp README.md LICENSE THIRD_PARTY_NOTICES.md SECURITY.md "$R/usr/share/doc/dockdesk/"
 gzip -9n -c CHANGELOG.md > "$R/usr/share/doc/dockdesk/changelog.gz"
@@ -50,6 +50,7 @@ Architecture: all
 Maintainer: Panem Yaswanth Reddy <panemyaswanthreddy@gmail.com>
 Depends: nodejs (>= 18.17), chromium | google-chrome-stable | chromium-browser
 Recommends: docker.io | docker-ce, docker-compose-v2 | docker-compose-plugin | docker-compose (>= 2), docker-buildx | docker-buildx-plugin, polkitd | policykit-1
+Suggests: python3-gi, gir1.2-ayatanaappindicator3-0.1
 Section: devel
 Priority: optional
 Description: Lightweight Docker Desktop alternative

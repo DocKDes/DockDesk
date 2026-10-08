@@ -16,7 +16,7 @@ zero npm dependencies** (xterm.js is bundled for the terminal).
 | **Labs** | One-click DVWA, Juice Shop, WebGoat, bWAPP, Mutillidae and a Kali toolbox, published on `127.0.0.1` only |
 | **Command palette** | Ctrl+K (or `/`): jump to any page, container, image, volume, network or compose project, and run actions like stop, restart, logs, terminal, pull, build |
 | **Activity** | The last 6 hours of Docker events plus a live feed, with search, type filter, a problems-only view and links to the container or image; the UI refreshes on change instead of polling hard |
-| **Settings** | Theme, refresh rate, crash notifications, registry sign-in, Docker group management, engine info |
+| **Settings** | Theme, language (English, Spanish, French, German, Hindi), refresh rate, crash and CPU/memory alerts, keyboard shortcuts (`?`), update check, optional system tray icon, export/import of settings, registry sign-in, Docker group management, engine info |
 
 ## Requirements
 
@@ -73,6 +73,8 @@ DockDesk can do anything the `docker` group can, which is root-equivalent. It is
 - Everything that reaches Docker is validated (names, ports, devices, capabilities, tags, paths) and commands run with argument lists, never through a shell.
 - **Engine start/stop** asks for your password via polkit. An *optional* one-time rule (`dockdesk-polkit.rules`, copy it from Settings) removes that prompt for `docker.service` only.
 - **Docker group management** (Settings) only touches the `docker` group, only regular local users, and always goes through `pkexec`, so it needs an administrator password every time.
+- **Update check** is the only thing DockDesk sends over the internet by itself, and only when you press the button (or once a day if you switch that on): one HTTPS request to `registry.npmjs.org` for the latest version. Nothing about your machine is sent. It never downloads or installs anything.
+- **System tray** (optional) is a small helper process that talks to DockDesk over its stdin/stdout only; it has no network access and never sees the token. Its menu can start or stop the Docker engine and stop all containers, the same things the app can already do.
 - **Registry sign-in** hands the password to `docker login --password-stdin`; Docker stores it, DockDesk never reads, returns or logs it. Without a credential helper Docker keeps it base64-encoded in `~/.docker/config.json` (mode 600).
 - **Labs** are intentionally vulnerable apps. Ports are bound to `127.0.0.1`; don't change that on a network you don't control.
 - The **host shell** is a real shell as your user. Treat the token like a password.

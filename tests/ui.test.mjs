@@ -3,6 +3,8 @@ import { describe, it, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
 import { join } from 'node:path'
+import { existsSync, readFileSync } from 'node:fs'
+import http from 'node:http'
 import { startServer, janitor, docker, dockerTry, dockerAvailable, waitFor, PREFIX } from './helpers.mjs'
 import { openPage, uiSkipReason, probeBrowser } from './cdp.mjs'
 
@@ -12,11 +14,12 @@ const probe = base || process.env.CI ? null : await probeBrowser()
 const skip = base || probe || false
 
 describe('DockDesk UI in a real browser', { skip }, () => {
-  let J, srv, page, IMG, main, work
+  let J, srv, page, IMG, main, work, updates
   const PAGES = ['dashboard', 'compose', 'containers', 'images', 'volumes', 'networks', 'labs', 'activity', 'settings']
   const HEADING = { dashboard: 'Overview', compose: 'Compose', containers: 'Containers', images: 'Images', volumes: 'Volumes', networks: 'Networks', labs: 'Labs', activity: 'Activity', settings: 'Settings' }
   // wait for the NEW page's own heading, so we never act on the previous page's leftovers
   const nav = async (name) => { await page.click(`#nav [data-p=${name}]`); await page.waitFor(`document.querySelector('#nav a.on')?.dataset.p === '${name}' && (document.querySelector('#page h2')?.textContent || '').startsWith('${HEADING[name]}')`) }
+  const nav_ = (n) => nav(n)
   // every test starts from a clean slate: no drawer, dialog, menu or palette left open
   const reset = () => page.eval(`document.querySelector('.detail #x')?.click();document.querySelector('.modal')?.remove();document.querySelector('.pal')?.remove();document.querySelector('#menu').hidden=true;true`)
   const openContainer = async (tab) => {
@@ -29,7 +32,9 @@ describe('DockDesk UI in a real browser', { skip }, () => {
 
   before(async () => {
     J = janitor(); IMG = J.image(); work = J.tmp('ui')
-    srv = await startServer({ env: { XDG_DATA_HOME: join(work, 'xdg') } })
+    updates = http.createServer((q, r) => { r.writeHead(200, { 'Content-Type': 'application/json' }); r.end(JSON.stringify({ version: '99.0.0' })) })
+    await new Promise((ok) => updates.listen(0, '127.0.0.1', ok))
+    srv = await startServer({ env: { XDG_DATA_HOME: join(work, 'xdg'), XDG_CONFIG_HOME: join(work, 'cfg'), DOCKDESK_UPDATE_URL: `http://127.0.0.1:${updates.address().port}/latest` } })
     main = `${PREFIX}-ui`
     const script = 'mkdir -p "/tmp/demo/sub folder"; printf "line one\\nline two\\n" > /tmp/demo/notes.txt; head -c 2000 /dev/urandom > /tmp/demo/blob.bin; i=0; while true; do i=$((i+1)); printf "\\033[32mINFO\\033[0m request $i ok\\n"; [ $((i%4)) -eq 0 ] && printf "\\033[31mERROR\\033[0m failed line $i\\n"; sleep 0.2; done'
     docker('run', '-d', '--name', main, '--stop-timeout', '1', '--entrypoint', 'sh', IMG, '-c', script)
@@ -38,7 +43,7 @@ describe('DockDesk UI in a real browser', { skip }, () => {
     await page.eval('window.confirm = () => true') // dialogs from the app are auto-accepted
     await page.waitFor(`document.querySelector('#nav [data-p]') !== null`)
   })
-  after(async () => { await page?.close(); srv?.stop(); J.cleanup() })
+  after(async () => { await page?.close(); srv?.stop(); updates?.close(); J.cleanup() })
 
   it('opens on Overview, with the sidebar in the intended order', async () => {
     assert.deepEqual(await page.eval(`[...document.querySelectorAll('#nav [data-p]')].map(a=>a.textContent.trim())`), ['Overview', 'Compose', 'Containers', 'Images', 'Volumes', 'Networks', 'Labs', 'Activity', 'Settings'])
@@ -75,7 +80,7 @@ describe('DockDesk UI in a real browser', { skip }, () => {
   it('Overview clean-up rows open the matching page filtered to what would be removed', async () => {
     const stoppedName = `${PREFIX}-zstop`; docker('create', '--name', stoppedName, IMG, 'true')
     try {
-    await nav('dashboard'); await page.waitFor(`document.querySelectorAll('.crow .cgo').length === 4`)
+    await nav('dashboard'); await page.waitFor(`document.querySelectorAll('.crow .cgo').length === 5`)
     await page.clickText('.crow .cgo', 'Stopped containers'); await page.waitFor(`document.querySelector('#nav a.on').dataset.p === 'containers' && document.querySelector('#cstop')?.checked`)
     assert.ok(await page.eval(`[...document.querySelectorAll('#rows tr')].some(r=>r.textContent.includes('${stoppedName}'))`), 'the stopped container is listed')
     assert.ok(!(await page.eval(`[...document.querySelectorAll('#rows tr')].some(r=>r.textContent.includes('${main}'))`)), 'running containers are hidden')
@@ -226,6 +231,265 @@ describe('DockDesk UI in a real browser', { skip }, () => {
     await page.waitFor(`JSON.parse(localStorage.getItem('settings')).refresh === 5`)
     await page.set('[data-setting=theme]', 'dark', ['change']); await page.waitFor(`document.documentElement.dataset.theme === 'dark'`)
     assert.match(await page.text('#page'), /Docker access/); assert.match(await page.text('.note'), /root-equivalent/)
+    await page.click('[data-call*=resetsettings]'); await page.waitFor(`JSON.parse(localStorage.getItem('settings')).refresh === 3`)
+  })
+
+  // ---- new features ----
+  const clip = async () => page.eval('window.__clip')
+  const captureClipboard = () => page.eval(`window.__clip = ''; Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: async (t) => { window.__clip = t } } }); true`)
+
+  it('run dialog: copy as docker run / Compose, fill from a pasted command, presets, and port conflicts', async () => {
+    await captureClipboard()
+    await nav('images')
+    await page.waitFor(`document.querySelectorAll('#irows tr [data-call*=run]').length > 0`)
+    await page.eval(`document.querySelector('#irows tr [data-call*=run]').click()`)
+    await page.waitFor(`!!document.querySelector('#rpaste')`)
+    await page.click('#rpaste')
+    await page.set('#rpastebox textarea', `docker run -d --name web1 -p 127.0.0.1:18080:80 -p 9000:9000/udp -v /data:/d -e 'A=b c' --restart=unless-stopped -m 256m --cpus 0.5 --cap-add NET_ADMIN --network host ${IMG}`, ['input'])
+    await page.click('#rpapply')
+    assert.equal(await page.eval(`document.querySelector('#rn').value`), 'web1')
+    assert.equal(await page.eval(`document.querySelectorAll('.rows[data-kind=ports] .rrow').length`), 2)
+    assert.equal(await page.eval(`document.querySelector('#ra-restart').value`), 'unless-stopped')
+    assert.equal(await page.eval(`document.querySelector('#ra-mem').value`), '256')
+    assert.equal(await page.eval(`document.querySelector('#ra-net').value`), 'host')
+    assert.equal(await page.eval(`document.querySelector('details.adv').open`), true)
+    await page.set('#ra-net', 'bridge')
+    await page.click('#rcopy')
+    assert.equal(await clip(), `docker run -d --name web1 -p 127.0.0.1:18080:80 -p 127.0.0.1:9000:9000/udp -v /data:/d -e 'A=b c' --restart unless-stopped --memory 256m --cpus 0.5 --cap-add NET_ADMIN ${IMG}`)
+    await page.click('#rccopy')
+    const yml = await clip()
+    assert.match(yml, /^services:\n {2}web1:\n {4}image: ".*"\n/); assert.match(yml, /- "127\.0\.0\.1:18080:80"/); assert.match(yml, /restart: unless-stopped/); assert.match(yml, /mem_limit: "256m"/)
+    // the generated compose file is accepted by docker compose
+    assert.ok((await srv.call('compose.validate', yml)).services.includes('web1'))
+    // presets: save, clear the form, load again
+    await page.eval(`window.prompt = () => 'ui preset'`)
+    await page.click('#rpsave')
+    await page.waitFor(`[...document.querySelectorAll('#rpre option')].some(o=>o.textContent==='ui preset')`)
+    await page.set('#rn', 'changed'); await page.set('#rpre', 'ui preset', ['change'])
+    await page.waitFor(`document.querySelector('#rn').value === 'web1'`)
+    await page.eval(`window.confirm = () => true`); await page.click('#rpdel')
+    await page.waitFor(`![...document.querySelectorAll('#rpre option')].some(o=>o.textContent==='ui preset')`)
+    // port conflict warning
+    const net = await import('node:net'), busy = net.createServer()
+    await new Promise((ok) => busy.listen(0, '127.0.0.1', ok))
+    try {
+      await page.set('.rows[data-kind=ports] .rrow input', String(busy.address().port))
+      await page.waitFor(`document.querySelector('#rwarn .warnbox')?.textContent.includes('${busy.address().port}')`)
+      await page.set('.rows[data-kind=ports] .rrow input', '')
+      await page.waitFor(`!document.querySelector('#rwarn .warnbox')`)
+    } finally { busy.close() }
+    await page.eval(`document.querySelector('#rpaste').click()`); await page.set('#rpastebox textarea', 'ls -la', ['input']); await page.click('#rpapply')
+    assert.match(await page.eval(`document.querySelector('#toast').textContent`), /does not start with/)
+    await reset()
+  })
+
+  it('copy as command works in the other dialogs', async () => {
+    await captureClipboard()
+    await nav('volumes')
+    await page.click('[data-call*=newvol]'); await page.waitFor(`!!document.querySelector('.modal .cli')`)
+    await page.set('input[name=name]', 'my-data'); await page.click('.modal .cli'); assert.equal(await clip(), 'docker volume create my-data')
+    await reset(); await nav('networks')
+    await page.click('[data-call*=newnet]'); await page.waitFor(`!!document.querySelector('.modal .cli')`)
+    await page.set('input[name=name]', 'my-net'); await page.set('input[name=subnet]', '10.20.0.0/24'); await page.click('.modal .cli')
+    assert.equal(await clip(), 'docker network create --subnet 10.20.0.0/24 my-net')
+    await reset(); await nav('images')
+    await page.eval(`document.querySelector('[data-call=\\'["pull"]\\']').click()`); await page.waitFor(`!!document.querySelector('.modal .cli')`)
+    await page.set('#pimg', 'nginx:alpine', ['input']); await page.click('.modal .cli'); assert.equal(await clip(), 'docker pull nginx:alpine')
+    await reset()
+    await page.click('[data-call*=\\"build\\"]'); await page.waitFor(`!!document.querySelector('#bdir')`)
+    await page.waitFor(`document.querySelector('#bdir').value !== ''`) // the picker fills in the home folder first
+    await page.set('#bdir', '/tmp', ['input']); await page.set('#btag', 'app:1', ['input']); await page.click('.modal .cli')
+    assert.equal(await clip(), 'docker build -f /tmp/Dockerfile -t app:1 /tmp')
+    await reset()
+    await page.click('[data-call*=importimg]'); await page.waitFor(`!!document.querySelector('#ipath')`)
+    await page.set('#ipath', '/tmp/a b.tar', ['input']); await page.click('.modal .cli'); assert.equal(await clip(), `docker load -i '/tmp/a b.tar'`)
+    await reset()
+    await openContainer('Settings'); await page.waitFor(`!!document.querySelector('#cs-save')`)
+    await page.set('#cs-restart', 'always', ['change']); await page.set('#cs-mem', '128', ['input']); await page.click('.detail .cli')
+    assert.equal(await clip(), `docker update --restart always --memory 128m --memory-swap 256m ${main}`)
+    await reset()
+  })
+
+  it('images: compare two images and see which layers differ', async () => {
+    const tiny = `${PREFIX}/cmp:1`, ctx = J.tmp('cmp')
+    execFileSync('sh', ['-c', `printf 'FROM scratch\\nENV ONLY_B=1\\nCOPY h.txt /h.txt\\n' > Dockerfile; echo hi > h.txt`], { cwd: ctx })
+    docker('build', '-q', '-t', tiny, ctx)
+    await nav('images')
+    await page.waitFor(`document.querySelector('#irows').textContent.includes('${PREFIX}/cmp')`)
+    await page.click('[data-call*=cmpimg]'); await page.waitFor(`!!document.querySelector('#cmpa')`)
+    await page.set('#cmpa', IMG, ['change']); await page.set('#cmpb', tiny, ['change']); await page.click('#cmpgo')
+    await page.waitFor(`document.querySelector('#cmpout .ctable')?.textContent.includes('Entrypoint')`)
+    const t = await page.text('#cmpout')
+    assert.match(t, /Environment differences/); assert.match(t, /ONLY_B/); assert.match(t, /Only in A \(\d+\)/); assert.match(t, /Only in B \(\d+\)/)
+    assert.match(t, /COPY h\.txt/)
+    await page.set('#cmpb', IMG, ['change']); await page.click('#cmpgo'); assert.match(await page.text('#cmpout'), /Pick two different images/)
+    await reset()
+    await page.click('[data-call*=imgupdates]') // images built or loaded locally cannot be checked: it must finish quietly
+    await page.waitFor(`/up to date|update/.test(document.querySelector('#toast').textContent)`)
+  })
+
+  it('files tab: edit a text file in place and keep its permissions', async () => {
+    docker('exec', main, 'sh', '-c', 'printf "before\\n" > /tmp/demo/ui-edit.txt; chmod 600 /tmp/demo/ui-edit.txt')
+    await openContainer('Files')
+    await page.waitFor(`document.querySelectorAll('.frow').length > 3`)
+    await page.set('#fpath', '/tmp/demo', []); await page.key('#fpath', 'Enter')
+    await page.waitFor(`[...document.querySelectorAll('.frow')].some(r=>r.dataset.name==='ui-edit.txt')`)
+    await page.eval(`[...document.querySelectorAll('.frow')].find(r=>r.dataset.name==='ui-edit.txt').click()`)
+    await page.waitFor(`!!document.querySelector('#pve')`)
+    await page.click('#pve'); await page.set('.modal textarea', 'after edit\nline 2\n', ['input']); await page.click('#pvsave')
+    await waitFor(() => dockerTry('exec', main, 'cat', '/tmp/demo/ui-edit.txt') === 'after edit\nline 2', { what: 'the edited file' })
+    assert.equal(dockerTry('exec', main, 'stat', '-c', '%a', '/tmp/demo/ui-edit.txt'), '600')
+    await page.waitFor(`document.querySelector('.pvcode')?.textContent.includes('after edit')`) // re-opened in read-only view
+    await reset()
+    await openContainer('Files'); await page.waitFor(`document.querySelectorAll('.frow').length > 3`); await page.set('#fpath', '/tmp/demo', []); await page.key('#fpath', 'Enter')
+    await page.waitFor(`[...document.querySelectorAll('.frow')].some(r=>r.dataset.name==='blob.bin')`)
+    await page.eval(`[...document.querySelectorAll('.frow')].find(r=>r.dataset.name==='blob.bin').click()`)
+    await page.waitFor(`document.querySelector('.modal .empty')?.textContent.includes('Binary')`)
+    assert.equal(await page.count('#pve'), 0)
+    await reset()
+  })
+
+  it('published ports have a copy button, and compose gets graph, env, profiles and per-service actions', async () => {
+    await captureClipboard()
+    const web = `${PREFIX}-uiport`
+    docker('run', '-d', '--name', web, '--stop-timeout', '1', '-p', '127.0.0.1::8080', '--entrypoint', 'sleep', IMG, '120')
+    const port = docker('port', web, '8080/tcp').split(':').pop()
+    await nav('containers')
+    await page.waitFor(`[...document.querySelectorAll('#rows tr')].some(r=>r.textContent.includes('${web}') && r.querySelector('.pcopy'))`)
+    await page.eval(`[...document.querySelectorAll('#rows tr')].find(r=>r.textContent.includes('${web}')).querySelector('.pcopy').click()`)
+    assert.equal(await clip(), `http://localhost:${port}`)
+
+    const proj = `${PREFIX}-uicp`
+    const svc = (n, x = '') => `  ${n}:\n    image: ${IMG}\n    entrypoint: ["sleep","600"]\n    stop_grace_period: 1s\n${x}`
+    const { file, dir } = await srv.call('compose.save', proj, `services:\n${svc('db')}${svc('web', '    depends_on:\n      - db\n')}`)
+    try {
+      await srv.call('compose.action', proj, dir, file, 'up')
+      await nav('compose')
+      await page.waitFor(`document.querySelector('#cprows').textContent.includes('${proj}')`)
+      await page.eval(`[...document.querySelectorAll('#cprows tr.cprow')].find(r=>r.textContent.includes('${proj}')).click()`)
+      await page.waitFor(`document.querySelectorAll('#cprows .nested [data-call*=svcscale]').length === 2 && document.querySelectorAll('#cprows .nested [data-call*="compose.service"]').length === 2`)
+      const menu = async (label) => { await page.eval(`[...document.querySelectorAll('#cprows tr.cprow')].find(r=>r.textContent.includes('${proj}')).querySelector('[data-call*=cmenu]').click()`); await page.clickText('#menu button', label) }
+      // dependency graph
+      await menu('Dependency graph')
+      await page.waitFor(`document.querySelectorAll('.graph svg g').length === 2 && document.querySelectorAll('.graph svg path[marker-end]').length === 1`)
+      assert.match(await page.text('.graph'), /db.*web|web.*db/); await reset()
+      // profiles: this project has none
+      await menu('Start with profiles'); await page.waitFor(`document.querySelector('.modal')?.textContent.includes('does not define any profiles')`); await reset()
+      // .env
+      await menu('Environment (.env)'); await page.waitFor(`!!document.querySelector('#envta')`)
+      await page.set('#envta', 'FOO=bar\n', ['input']); await page.click('#envs'); await waitFor(() => existsSync(join(dir, '.env')) && readFileSync(join(dir, '.env'), 'utf8') === 'FOO=bar\n', { what: '.env to be written' })
+      await reset()
+      // per-service restart and scale
+      const webId = () => docker('ps', '-q', '--filter', `label=com.docker.compose.project=${proj}`, '--filter', 'label=com.docker.compose.service=web')
+      const started = () => docker('inspect', '-f', '{{.State.StartedAt}}', webId())
+      const t0 = started()
+      await page.eval(`[...document.querySelectorAll('#cprows .nested tr')].find(r=>r.textContent.includes('web')).querySelector('[data-call*="compose.service"]').click()`)
+      await waitFor(() => started() !== t0, { timeout: 30000, what: 'the web service to restart' })
+      await page.eval(`[...document.querySelectorAll('#cprows .nested tr')].find(r=>r.querySelector('.nm')?.textContent==='web').querySelector('[data-call*=svcscale]').click()`)
+      await page.waitFor(`!!document.querySelector('.modal input[name=n]')`)
+      await page.click('.modal .cli'); assert.match(await clip(), /--scale web=1 web$/)
+      await page.set('input[name=n]', '2'); await page.click('.modal form .pri')
+      await waitFor(() => docker('ps', '-q', '--filter', `label=com.docker.compose.project=${proj}`, '--filter', 'label=com.docker.compose.service=web').split('\n').filter(Boolean).length === 2, { timeout: 30000, what: 'two web containers' })
+    } finally {
+      dockerTry('compose', '-p', proj, '-f', file, 'down', '-t', '1')
+      dockerTry('rm', '-f', web)
+      await reset()
+    }
+  })
+
+  it('keyboard shortcuts: ? opens the cheat sheet, g then a letter navigates, t and r work, typing is left alone', async () => {
+    const press = (key, target = 'body') => page.eval(`document.querySelector(${JSON.stringify(target)}).dispatchEvent(new KeyboardEvent('keydown',{key:${JSON.stringify(key)},bubbles:true}))`)
+    await nav('dashboard')
+    await press('?'); await page.waitFor(`!!document.querySelector('.modal.keys')`)
+    const sheet = await page.text('.modal.keys')
+    for (const w of ['Keyboard shortcuts', 'Anywhere', 'Go to a page', 'Open search and commands', 'Show this cheat sheet', 'In the log viewer']) assert.ok(sheet.includes(w), `sheet mentions ${w}`)
+    assert.equal(await page.count('.modal.keys kbd') > 20, true)
+    await press('?'); await page.waitFor(`!document.querySelector('.modal')`) // ? again closes it
+    await press('?'); await page.waitFor(`!!document.querySelector('.modal.keys')`); await press('Escape'); await page.waitFor(`!document.querySelector('.modal')`)
+    // g, then a letter
+    const via = { c: 'containers', i: 'images', v: 'volumes', n: 'networks', l: 'labs', a: 'activity', s: 'settings', m: 'compose', o: 'dashboard' }
+    for (const [k, p] of Object.entries(via)) { await press('g'); await press(k); await page.waitFor(`document.querySelector('#nav a.on').dataset.p === '${p}'`) }
+    await press('g'); await press('z'); assert.equal(await page.eval(`document.querySelector('#nav a.on').dataset.p`), 'dashboard', 'an unknown second key does nothing')
+    // not while typing in a field
+    await nav('containers'); await page.waitFor(`!!document.querySelector('#cq')`)
+    await page.eval(`document.querySelector('#cq').focus()`); await press('g', '#cq'); await press('i', '#cq')
+    assert.equal(await page.eval(`document.querySelector('#nav a.on').dataset.p`), 'containers', 'typing "gi" in a search box does not navigate')
+    // footer button
+    await page.eval(`document.querySelector('#cq').blur()`); await page.click('#status [data-call*=shortcuts]'); await page.waitFor(`!!document.querySelector('.modal.keys')`); await reset()
+    // every shortcut the sheet lists works from Settings too
+    await nav('settings'); await page.clickText('[data-call*=shortcuts]', 'Show'); await page.waitFor(`!!document.querySelector('.modal.keys')`); await reset()
+  })
+
+  it('language: switches menus and titles, remembers it, and goes back to English', async () => {
+    await nav('settings')
+    await page.waitFor(`!!document.querySelector('select[data-setting=lang]')`)
+    const opts = await page.eval(`[...document.querySelectorAll('select[data-setting=lang] option')].map(o=>o.value+':'+o.textContent)`)
+    assert.deepEqual(opts, ['auto:Automatic', 'en:English', 'es:Español', 'fr:Français', 'de:Deutsch', 'hi:हिन्दी'])
+    await page.set('select[data-setting=lang]', 'es', ['change'])
+    await page.waitFor(`document.querySelector('#nav [data-p=containers]').textContent.trim() === 'Contenedores'`)
+    assert.equal(await page.eval(`document.documentElement.lang`), 'es')
+    assert.deepEqual(await page.eval(`[...document.querySelectorAll('#nav [data-p]')].map(a=>a.textContent.trim())`), ['Resumen', 'Compose', 'Contenedores', 'Imágenes', 'Volúmenes', 'Redes', 'Laboratorios', 'Actividad', 'Ajustes'])
+    await page.waitFor(`document.querySelector('#page h2')?.textContent.startsWith('Ajustes')`)
+    assert.match(await page.text('#page'), /Idioma/); assert.match(await page.text('#status'), /Terminal/)
+    await page.set('select[data-setting=lang]', 'hi', ['change']); await page.waitFor(`document.querySelector('#nav [data-p=containers]').textContent.trim() === 'कंटेनर'`)
+    assert.equal(JSON.parse(await page.eval(`localStorage.getItem('settings')`)).lang, 'hi')
+    await page.click('#nav [data-p=containers]'); await page.waitFor(`document.querySelector('#page h2')?.textContent.startsWith('कंटेनर')`)
+    await page.eval(`(()=>{const s=JSON.parse(localStorage.getItem('settings'));s.lang='auto';localStorage.setItem('settings',JSON.stringify(s))})()`)
+    await page.eval(`location.reload()`); await page.waitFor(`document.querySelector('#nav [data-p]') !== null && document.querySelector('#nav [data-p=containers]').textContent.trim() === 'Containers'`)
+    await page.eval('window.confirm = () => true')
+  })
+
+  it('updates: checking shows the new version, the install command and a pill in the status bar', async () => {
+    await nav_('settings')
+    await page.waitFor(`!!document.querySelector('[data-call*=checkupdate]')`)
+    assert.match(await page.text('#page'), /DockDesk v\d/); assert.match(await page.text('#page'), /Installed with/)
+    await page.click('[data-call*=checkupdate]')
+    await page.waitFor(`document.querySelector('#status .upd')?.textContent.includes('v99.0.0')`)
+    await page.waitFor(`document.querySelector('#page').textContent.includes('DockDesk 99.0.0 is available')`)
+    assert.match(await page.text('#page'), /git pull/, 'source installs are told to git pull')
+    assert.equal(await page.count('[data-call*=openrelease]') > 0, true)
+    await page.click('#status .upd'); await page.waitFor(`document.querySelector('#nav a.on').dataset.p === 'settings'`)
+    // the daily check is opt-in
+    assert.equal(JSON.parse(await page.eval(`localStorage.getItem('settings')`)).autoUpdate ?? false, false)
+    assert.equal(await page.eval(`document.querySelector('[data-setting=autoUpdate]').checked`), false)
+  })
+
+  it('tray row: shown with a switch, and explains what is missing when the tray cannot run here', async () => {
+    await nav_('settings'); await page.waitFor(`!!document.querySelector('[data-setting=tray]')`)
+    const t = await page.text('#page')
+    assert.match(t, /System tray icon/)
+    const avail = await page.eval(`!document.querySelector('[data-setting=tray]').disabled`)
+    if (!avail) assert.match(t, /python3-gi/)
+  })
+
+  it('settings backup: export writes a file, import restores it, and bad files are refused', async () => {
+    await nav_('settings'); await page.waitFor(`!!document.querySelector('[data-call*=exportsettings]')`)
+    // set something recognisable, then capture what Export would download
+    await page.set('select[data-setting=refresh]', '10', ['change']); await page.waitFor(`JSON.parse(localStorage.getItem('settings')).refresh === 10`)
+    await page.waitFor(`!!document.querySelector('[data-call*=exportsettings]')`)
+    await page.eval(`window.__dl = null; HTMLAnchorElement.prototype.click = function () { window.__dlName = this.download; fetch(this.href).then((r) => r.text()).then((t) => (window.__dl = t)) }`)
+    await page.click('[data-call*=exportsettings]'); await page.waitFor(`window.__dl !== null`)
+    assert.equal(await page.eval(`window.__dlName`), 'dockdesk-settings.json')
+    const doc = JSON.parse(await page.eval(`window.__dl`))
+    assert.equal(doc.app, 'dockdesk'); assert.equal(doc.format, 1); assert.equal(doc.settings.refresh, 10); assert.ok(!JSON.stringify(doc).match(/password|auth/i))
+    assert.ok(['auto', 'light', 'dark'].includes(doc.theme)); assert.equal(typeof doc.tray, 'boolean')
+    // change things, then import the exported file
+    await page.set('select[data-setting=refresh]', '30', ['change']); await page.waitFor(`JSON.parse(localStorage.getItem('settings')).refresh === 30`)
+    const upload = (name, text) => page.eval(`(()=>{const dt=new DataTransfer();dt.items.add(new File([${JSON.stringify(text)}],${JSON.stringify(name)}));const i=document.querySelector('#importfile');i.files=dt.files;i.dispatchEvent(new Event('change',{bubbles:true}))})()`)
+    await page.waitFor(`!!document.querySelector('#importfile')`)
+    await upload('s.json', JSON.stringify({ ...doc, runPresets: { 'imported one': { image: 'x:1', ports: [], volumes: [], env: [] }, 'bad one': { image: 5 } } }))
+    await page.waitFor(`JSON.parse(localStorage.getItem('settings')).refresh === 10`)
+    await page.waitFor(`/Settings imported/.test(document.querySelector('#toast').textContent)`)
+    assert.deepEqual(Object.keys(JSON.parse(await page.eval(`localStorage.getItem('runPresets')`))), ['imported one'], 'only well-formed presets are taken')
+    // hostile or wrong files change nothing
+    await page.waitFor(`!!document.querySelector('#importfile')`)
+    await upload('x.json', JSON.stringify({ app: 'dockdesk', format: 1, settings: { refresh: -5, lang: 'xx', evil: 1, notify: 'yes', alertCpu: 1e9 }, theme: 'neon' }))
+    await page.waitFor(`/Settings imported: 0 settings/.test(document.querySelector('#toast').textContent)`)
+    const after = JSON.parse(await page.eval(`localStorage.getItem('settings')`))
+    assert.equal(after.refresh, 10); assert.equal(after.lang, 'auto'); assert.equal(after.notify, false); assert.equal(after.alertCpu, 0); assert.ok(!('evil' in after))
+    await upload('y.json', 'this is not json'); await page.waitFor(`/not a DockDesk settings file/.test(document.querySelector('#toast').textContent)`)
+    await upload('z.json', JSON.stringify({ app: 'other', format: 1, settings: {} })); await page.waitFor(`/not a DockDesk settings file/.test(document.querySelector('#toast').textContent)`)
+    await page.eval(`localStorage.removeItem('runPresets')`)
     await page.click('[data-call*=resetsettings]'); await page.waitFor(`JSON.parse(localStorage.getItem('settings')).refresh === 3`)
   })
 
