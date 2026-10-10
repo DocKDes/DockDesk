@@ -442,7 +442,8 @@ describe('DockDesk UI in a real browser', { skip }, () => {
 
   it('language: the whole interface is translated (not only menus), data stays as it is, and English comes back', async () => {
     try {
-      const left = () => page.eval(`import('/translate.js').then((m)=>{const u=m.untranslated();return [...u.text,...u.attr].filter((t)=>/^[A-Z][a-z]+(\\s+\\S+)*$/.test(t)&&!/${PREFIX}|^(CPU|RAM|Docker|DockDesk|Ctrl|Shift|Enter|Esc|Kali|Mutillidae)\\b/.test(t)&&!/^[A-Z][a-z]{2} \\d/.test(t))})`)
+      // host data is never translated: the OS name and version ("Ubuntu 24.04.5 LTS"), versions, fixture names
+    const left = () => page.eval(`import('/translate.js').then((m)=>{const u=m.untranslated();return [...u.text,...u.attr].filter((t)=>/^[A-Z][a-z]+(\\s+\\S+)*$/.test(t)&&!/${PREFIX}|^(CPU|RAM|Docker|DockDesk|Ctrl|Shift|Enter|Esc|Kali|Mutillidae)\\b|\\d+\\.\\d+|\\bLinux\\b/.test(t)&&!/^[A-Z][a-z]{2} \\d/.test(t))})`)
       await nav('settings')
       await page.waitFor(`!!document.querySelector('select[data-setting=lang]')`)
       await page.set('select[data-setting=lang]', 'fr', ['change'])
