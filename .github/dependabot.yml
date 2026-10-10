@@ -1,7 +1,12 @@
 # The app has no npm dependencies; only the GitHub Actions the workflows use need keeping current.
+# One pull request a month with every action update in it, instead of one per action per week.
 version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
-      interval: weekly
+      interval: monthly
+    open-pull-requests-limit: 1
+    groups:
+      actions:
+        patterns: ["*"]
