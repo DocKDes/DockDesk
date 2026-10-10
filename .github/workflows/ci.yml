@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -43,7 +43,7 @@ jobs:
           - { os: ubuntu-latest, node: 20 }
           - { os: ubuntu-latest, node: 18 }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
@@ -59,7 +59,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -74,7 +74,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -106,7 +106,7 @@ jobs:
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ./release/dockdesk_*_all.deb
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           path: src
       - name: Start the installed app and check it answers
