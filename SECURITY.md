@@ -8,7 +8,7 @@ DockDesk is pre-1.0 and maintained by one person. Only the **latest release** ge
 
 | Version | Supported |
 |---|---|
-| latest `0.1.x` release (see the [releases page](https://github.com/DocKDes/DockDesk/releases/latest)) | yes |
+| latest `0.2.x` release (see the [releases page](https://github.com/DocKDes/DockDesk/releases/latest)) | yes |
 | anything older | no (update to the latest) |
 
 When 1.0 is released this table will say how long each line is supported.
@@ -62,4 +62,4 @@ sha256sum -c SHA256SUMS --ignore-missing                  # the file matches the
 gh attestation verify dockdesk_<version>_all.deb --repo DocKDes/DockDesk   # it was built by the release workflow
 ```
 
-Attestations are attached to releases built after this was introduced; older releases only have `SHA256SUMS`. There is no apt repository or GPG signature yet, so an `apt upgrade` path does not exist: updating is always a deliberate download.
+Attestations are attached to releases from 0.2.0 on; older releases only have `SHA256SUMS`. There is no apt repository or GPG signature yet, so an `apt upgrade` path does not exist: updating is always a deliberate download.

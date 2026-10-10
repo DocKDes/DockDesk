@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 (2026-10-10)
 
 **Updates and security policy**
 - Settings → Updates has **Download and verify** for `.deb` and `install.sh` installs: it downloads the new release from GitHub (HTTPS only, GitHub addresses only, size-limited), refuses it unless its SHA-256 matches the release's `SHA256SUMS`, checks the signed build attestation when `gh` is installed (and removes the file if that check fails), saves it with mode 600 and shows the exact install command. Nothing is installed; that stays your decision.
