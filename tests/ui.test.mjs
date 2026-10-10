@@ -458,6 +458,9 @@ describe('DockDesk UI in a real browser', { skip }, () => {
       await page.eval(`document.querySelector('details.adv').open = true`); seen['run dialog'] = await left(); await reset()
       const leftover = Object.fromEntries(Object.entries(seen).filter(([, v]) => v.length))
       assert.deepEqual(leftover, {}, 'untranslated text in French')
+      // a sentence with inline markup is rebuilt from nodes: bold and code spans survive, and no tag text leaks onto the page
+      await navL('labs'); await page.waitFor(`!!document.querySelector('.note b')`)
+      assert.deepEqual(await page.eval(`(()=>{const n=document.querySelector('.note');return {bold:n.querySelector('b').textContent,code:n.querySelector('.mono').textContent,leak:/[<>]|&lt;|&amp;/.test(n.textContent)}})()`), { bold: 'Ces applications sont volontairement vulnérables.', code: '127.0.0.1', leak: false })
       // translated through patterns and nested values
       await navL('containers'); await page.waitFor(`[...document.querySelectorAll('#rows tr')].some(r=>r.textContent.includes('${main}'))`)
       assert.match(await page.text('#page'), /Actif|Arrêté|En cours|il y a|Il y a/i, 'container status and ages are translated')
@@ -470,6 +473,7 @@ describe('DockDesk UI in a real browser', { skip }, () => {
       await page.waitFor(`document.querySelector('#nav [data-p=containers]').textContent.trim() === 'Containers'`)
       await navL('containers'); await page.waitFor(`/Only show stopped/.test(document.querySelector('#page').textContent)`)
       assert.equal(await page.eval(`(document.documentElement.lang)`), 'en')
+      await navL('labs'); await page.waitFor(`document.querySelector('.note b')?.textContent === 'These apps are intentionally vulnerable.'`)
       await page.eval(`(()=>{const s=JSON.parse(localStorage.getItem('settings'));s.lang='auto';localStorage.setItem('settings',JSON.stringify(s))})()`)
     } finally {
       await page.click('#nav [data-p=settings]'); await page.waitFor(`!!document.querySelector('select[data-setting=lang]')`)

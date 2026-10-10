@@ -31,7 +31,9 @@ function jsonModel(obj) {
 
 export function jsonViewer(pane, obj, kind) {
   const { lines, paths } = jsonModel(obj)
-  const plain = lines.map((l) => l.replace(/<[^>]+>/g, '').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&'))
+  // plain text of each line for searching (never inserted as HTML): remove tags until none are left, so "<<b>script>" cannot survive, then unescape
+  const stripTags = (l) => { let prev; do { prev = l; l = l.replace(/<[^<>]*>/g, '') } while (l !== prev); return l }
+  const plain = lines.map((l) => stripTags(l).replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&'))
   const spec = CHIPS[kind] || Object.entries(obj).filter(([, v]) => v && typeof v === 'object').slice(0, 12).map(([k]) => [k, k])
   const chips = spec.filter(([, p]) => paths.has(p)).map(([label, p]) => ({ label, line: paths.get(p) })).sort((a, b) => a.line - b.line)
   pane.classList.add('flush')

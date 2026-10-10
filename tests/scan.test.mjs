@@ -15,10 +15,11 @@ describe('scan', () => {
   let srv, dir, mode = 'ok'
   before(async () => {
     dir = J.tmp('scan')
-    // `--version` succeeds; otherwise behave like the mode file says: print progress and JSON, or hang (recording the pid so the test can see it die)
+    // `--version` succeeds; otherwise behave like the mode file says: print progress and JSON, or hang. The pid is written BEFORE the first progress line,
+    // because the test stops the stream at that line and then looks for the pid (on a slow runner it used to look too early).
     const sh = shim(dir, 'trivy', { body: `case "$1" in --version) exit 0;; esac
+if [ "$(cat "${dir}/mode")" = hang ]; then echo $$ > "${dir}/pid"; echo "downloading database" >&2; exec sleep 60; fi
 echo "downloading database" >&2
-if [ "$(cat "${dir}/mode")" = hang ]; then echo $$ > "${dir}/pid"; exec sleep 60; fi
 cat <<'JSON'
 ${FOUND}
 JSON` })
