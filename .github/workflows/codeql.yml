@@ -15,7 +15,7 @@ jobs:
       contents: read
       security-events: write   # upload the results to the repository's Security tab
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: github/codeql-action/init@v3
         with:
           languages: javascript-typescript,python
