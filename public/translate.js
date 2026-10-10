@@ -77,7 +77,7 @@ function translateText(node) {
   const lead = /^\s*/.exec(raw)[0], trail = /\s*$/.exec(raw)[0]
   const next = lead + out + trail
   textOrig.set(node, { src: raw, out: next })
-  node.data = next
+  node.nodeValue = next
 }
 
 // a vulnerability row's tooltip is the scanner's own description (data)
@@ -106,6 +106,22 @@ function richCandidate(el) {
 }
 // A translation written with a few inline tags becomes DOM nodes without handing a string to the HTML parser: tags are matched against an
 // allow-list (the same inline tags richCandidate accepts, attributes class and id only) and everything else is added as plain text.
+// Elements are only ever created from these literal names; the tag text found in a translation is just a key, never the name itself.
+const INLINE_TAGS = new Set(['b', 'strong', 'i', 'em', 'code', 'kbd', 'span', 'small', 'br', 'mark'])
+function makeInline(tag) {
+  switch (tag) {
+    case 'b': return document.createElement('b')
+    case 'strong': return document.createElement('strong')
+    case 'i': return document.createElement('i')
+    case 'em': return document.createElement('em')
+    case 'code': return document.createElement('code')
+    case 'kbd': return document.createElement('kbd')
+    case 'small': return document.createElement('small')
+    case 'br': return document.createElement('br')
+    case 'mark': return document.createElement('mark')
+    default: return document.createElement('span')
+  }
+}
 const ENTITIES = { '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"', '&#39;': "'" }
 const decode = (t) => t.replace(/&(?:amp|lt|gt|quot|#39);/g, (m) => ENTITIES[m])
 function nodesFrom(markup) {
@@ -113,9 +129,9 @@ function nodesFrom(markup) {
   for (const m of markup.matchAll(/<(\/?)([a-z]+)((?:\s+[a-z-]+="[^"<>]*")*)\s*(\/?)>|([^<]+)/g)) {
     if (m[5] !== undefined) { open.at(-1).append(document.createTextNode(decode(m[5]))); continue }
     const [all, close, tag, attrs, self] = m
-    if (!INLINE_OK.has(tag.toUpperCase())) { open.at(-1).append(document.createTextNode(all)); continue }
+    if (!INLINE_TAGS.has(tag)) { open.at(-1).append(document.createTextNode(all)); continue }
     if (close) { if (open.length > 1) open.pop(); continue }
-    const el = document.createElement(tag)
+    const el = makeInline(tag)
     for (const a of attrs.matchAll(/([a-z-]+)="([^"<>]*)"/g)) if (a[1] === 'class' || a[1] === 'id') el.setAttribute(a[1], decode(a[2]))
     open.at(-1).append(el)
     if (!self && tag !== 'br') open.push(el)
@@ -175,7 +191,7 @@ export function retranslate() {
   if (!observer) return
   apply(() => {
     const tw = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT)
-    for (let n = tw.nextNode(); n; n = tw.nextNode()) { const k = textOrig.get(n); if (k && n.data === k.out) { n.data = k.src; textOrig.delete(n) } }
+    for (let n = tw.nextNode(); n; n = tw.nextNode()) { const k = textOrig.get(n); if (k && n.data === k.out) { n.nodeValue = k.src; textOrig.delete(n) } }
     for (const el of document.querySelectorAll('[data-tr]')) { if (el.__trOrig) el.replaceChildren(...el.__trOrig); delete el.__trOrig; delete el.dataset.tr; rich.delete(el) }
     for (const el of document.querySelectorAll('*')) if (el.__tra) { for (const [a, k] of Object.entries(el.__tra)) if (el.getAttribute(a) === k.out) el.setAttribute(a, k.src); delete el.__tra }
   })
