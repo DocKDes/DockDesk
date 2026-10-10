@@ -13,7 +13,7 @@ jobs:
     env:
       NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -30,7 +30,7 @@ jobs:
       - run: sh packaging/release.sh
       - run: sh packaging/smoke-test.sh .
       - name: Attest the release files (signed proof of which workflow built them)
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: |
             dist/release/*.deb
