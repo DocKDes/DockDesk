@@ -5,6 +5,7 @@ on:
 permissions:
   contents: write      # create the GitHub release
   id-token: write      # npm provenance (links the npm package to this exact build)
+  attestations: write  # signed build attestation for the release files (Sigstore); `gh attestation verify` checks it
 jobs:
   release:
     runs-on: ubuntu-latest
@@ -19,8 +20,22 @@ jobs:
           registry-url: https://registry.npmjs.org
       - name: Tag must match package.json
         run: test "v$(node -p "require('./package.json').version")" = "$GITHUB_REF_NAME"
+      - name: CHANGELOG has a section for this version
+        run: |
+          VER=$(node -p "require('./package.json').version")
+          grep -q "^## $VER " CHANGELOG.md || { echo "::error::CHANGELOG.md has no '## $VER (date)' section: rename the Unreleased heading before tagging"; exit 1; }
       - run: npm test
+        env:
+          CI: 'true'
       - run: sh packaging/release.sh
+      - run: sh packaging/smoke-test.sh .
+      - name: Attest the release files (signed proof of which workflow built them)
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/release/*.deb
+            dist/release/*.tar.gz
+            dist/release/SHA256SUMS
       - name: GitHub release (safe to re-run)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -49,19 +49,24 @@ async function dk(method, url, body) {
   try { return text ? JSON.parse(text) : null } catch { return text }
 }
 
-const runQuiet = (cmd, args) =>
+// Every command DockDesk runs has a time limit, so a stuck one can't hang a request forever (the JSON API can't be cancelled from the page;
+// streamed jobs like build, push and scan can, and are stopped when the page closes the stream). Slow jobs pass a longer limit.
+const MIN = 60 * 1000
+const run = (cmd, args, cwd, timeout = 2 * MIN) =>
   new Promise((resolve, reject) =>
-    execFile(cmd, args, { maxBuffer: 256 << 20, timeout: 15 * 60 * 1000 }, (err, out, e2) =>
-      err ? reject(new Error((e2 || err.message).trim().split('\n').slice(-3).join(' '))) : resolve(out)
+    execFile(cmd, args, { cwd, maxBuffer: 16 << 20, timeout, killSignal: 'SIGKILL' }, (err, out, e2) =>
+      err ? reject(new Error(err.killed ? `${cmd} did not finish within ${Math.round(timeout / MIN)} minute(s) and was stopped` : (e2 || err.message).trim())) : resolve(out + e2)
     )
   )
 
-const run = (cmd, args, cwd) =>
-  new Promise((resolve, reject) =>
-    execFile(cmd, args, { cwd, maxBuffer: 16 << 20 }, (err, out, e2) =>
-      err ? reject(new Error((e2 || err.message).trim())) : resolve(out + e2)
-    )
-  )
+// Stop a child process: ask politely, then force it if it is still there a few seconds later (docker, trivy and friends can ignore SIGTERM mid-download).
+function killProc(proc) {
+  if (proc.exitCode !== null || proc.signalCode) return
+  proc.kill('SIGTERM')
+  const t = setTimeout(() => { if (proc.exitCode === null && !proc.signalCode) proc.kill('SIGKILL') }, 5000)
+  t.unref()
+  proc.once('close', () => clearTimeout(t))
+}
 
 // ---------- App info, update check, settings file, system tray ----------
 const APP = (() => { try { return JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8')) } catch { return {} } })()
@@ -69,6 +74,7 @@ const VERSION = APP.version || 'unknown'
 const RELEASES_URL = 'https://github.com/DocKDes/DockDesk/releases/latest'
 const UPDATE_URL = process.env.DOCKDESK_UPDATE_URL || 'https://registry.npmjs.org/dockdesk/latest' // overridable for tests
 function installKind() {
+  if (process.env.DOCKDESK_UPDATE_URL && process.env.DOCKDESK_INSTALL_KIND) return process.env.DOCKDESK_INSTALL_KIND // tests only (the update address is overridden too)
   if (__dirname.includes(`${path.sep}node_modules${path.sep}`)) return 'npm'
   if (__dirname === '/opt/dockdesk') return 'deb'
   if (__dirname === path.join(os.homedir(), '.local', 'share', 'dockdesk')) return 'script'
@@ -95,6 +101,45 @@ function fetchJson(url, ms = 8000) {
     req.on('timeout', () => req.destroy(new Error('The update server did not answer in time')))
     req.on('error', (e) => reject(new Error(/ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ENETUNREACH|EHOSTUNREACH/.test(e.code || e.message) ? 'Could not reach the update server. Are you online?' : e.message)))
   })
+}
+
+// ---------- Downloading a verified update (only when you press "Download and verify"; it never installs anything) ----------
+// Releases are published on GitHub with a SHA256SUMS file and a build attestation (see SECURITY.md). This fetches the .deb (or the .tar.gz
+// for install.sh installs) for the version npm reports, checks its SHA-256 against SHA256SUMS, checks the attestation when the `gh` tool is
+// installed, and saves it for you to install yourself: installing a package is a root action, so it stays your decision.
+const RELEASE_BASE = process.env.DOCKDESK_RELEASE_URL || 'https://github.com/DocKDes/DockDesk/releases/download' // overridable for tests
+const UPDATES_DIR = path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache'), 'dockdesk', 'updates')
+const releaseHostOk = (host) => host === 'github.com' || host.endsWith('.githubusercontent.com') || (!!process.env.DOCKDESK_RELEASE_URL && host === new URL(process.env.DOCKDESK_RELEASE_URL).hostname)
+// GET a release file into memory: https only, only GitHub's hosts (release files redirect to *.githubusercontent.com), a size cap, a time limit.
+function downloadRelease(url, maxBytes, hops = 4) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url)
+    const test = !!process.env.DOCKDESK_RELEASE_URL
+    if (u.protocol !== 'https:' && !(test && u.protocol === 'http:')) return reject(new Error('Updates are only downloaded over https'))
+    if (!releaseHostOk(u.hostname)) return reject(new Error(`Refusing to download from ${u.hostname}: not a GitHub release address`))
+    const req = (u.protocol === 'https:' ? require('node:https') : http).get(u, { headers: { 'User-Agent': `DockDesk/${VERSION}` }, timeout: 30000 }, (res) => {
+      if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
+        res.resume()
+        if (hops <= 0) return reject(new Error('Too many redirects while downloading the update'))
+        return downloadRelease(new URL(res.headers.location, u).href, maxBytes, hops - 1).then(resolve, reject)
+      }
+      if (res.statusCode !== 200) { res.resume(); return reject(new Error(res.statusCode === 404 ? 'That release file is not published (yet)' : `The download server answered ${res.statusCode}`)) }
+      const chunks = []; let n = 0
+      res.on('data', (c) => { n += c.length; if (n > maxBytes) req.destroy(new Error('The update file is larger than expected, so it was not downloaded')); else chunks.push(c) })
+      res.on('end', () => resolve(Buffer.concat(chunks)))
+      res.on('error', reject)
+    })
+    req.on('timeout', () => req.destroy(new Error('The download server did not answer in time')))
+    req.on('error', (e) => reject(new Error(/ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ENETUNREACH|EHOSTUNREACH/.test(e.code || e.message) ? 'Could not reach the download server. Are you online?' : e.message)))
+  })
+}
+// 'verified' | 'failed' | 'unavailable' (with a reason). Uses GitHub's own tool, when installed, to check the Sigstore build attestation of the file.
+async function verifyAttestation(file) {
+  try { await run('gh', ['--version'], undefined, 10000) } catch { return { state: 'unavailable', reason: 'The GitHub CLI (gh) is not installed' } }
+  try { await run('gh', ['attestation', 'verify', file, '--repo', 'DocKDes/DockDesk'], undefined, 60000); return { state: 'verified' } } catch (e) {
+    const msg = String(e.message).trim().split('\n').slice(-2).join(' ').slice(0, 300)
+    return /verification failed|no attestations|failed to verify|did not match|invalid/i.test(msg) ? { state: 'failed', reason: msg } : { state: 'unavailable', reason: msg }
+  }
 }
 
 // Settings that must live on the server (it needs them before any window exists): ~/.config/dockdesk/config.json
@@ -170,7 +215,7 @@ async function engineCtl(verb) {
     return await run('systemctl', ['--no-ask-password', verb, ...units])
   } catch (e) {
     if (!NEEDS_AUTH.test(e.message)) throw e
-    return run('pkexec', ['systemctl', verb, ...units])
+    return run('pkexec', ['systemctl', verb, ...units], undefined, 5 * MIN)
   }
 }
 
@@ -432,6 +477,70 @@ const enc = encodeURIComponent
 const filters = (o) => enc(JSON.stringify(o))
 const seg = (s) => enc(String(s))
 
+
+// ---------- Vulnerability scans: install hint, normalised results, saved last result per image ----------
+const SCAN_SEV = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'UNKNOWN']
+const SCAN_LIMIT = 10 * MIN // the first scan also downloads the scanner's vulnerability database
+const SCAN_DIR = path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share'), 'dockdesk', 'scans')
+const SCAN_KEEP = 50 // saved results kept (newest first); older ones are removed
+function scanInstallHint() {
+  const rel = {}
+  try { for (const l of fs.readFileSync('/etc/os-release', 'utf8').split('\n')) { const m = /^(\w+)=(["']?)(.*)\2$/.exec(l); if (m) rel[m[1]] = m[3] } } catch {}
+  const ids = [rel.ID, ...(rel.ID_LIKE || '').split(/\s+/)].filter(Boolean)
+  const cmd = rel.ID === 'kali' ? 'sudo apt install trivy' : ids.includes('arch') ? 'sudo pacman -S trivy' : ids.includes('alpine') ? 'sudo apk add trivy' : ''
+  return cmd ? `Install a scanner (Trivy or Grype), for example: ${cmd}` : 'Install a scanner (Trivy or Grype). Trivy: https://trivy.dev/latest/getting-started/installation/ , Grype: https://github.com/anchore/grype#installation'
+}
+async function scanSpec(ref) {
+  ref = String(ref || '')
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._:\/@-]{0,255}$/.test(ref)) throw new Error('Invalid image reference')
+  const tool = await handlers['scan.tool']()
+  if (!tool) throw new Error(scanInstallHint())
+  return { tool, ref, args: tool === 'trivy' ? ['image', '--quiet', '--format', 'json', '--scanners', 'vuln', ref] : [ref, '-o', 'json'] }
+}
+// Buffered run (no progress) for the plain API call; stopped after SCAN_LIMIT.
+const runScan = (spec) =>
+  new Promise((resolve, reject) =>
+    execFile(spec.tool, spec.args, { maxBuffer: 256 << 20, timeout: SCAN_LIMIT, killSignal: 'SIGKILL' }, (err, out, e2) =>
+      err ? reject(new Error(err.killed ? `The scan did not finish within ${SCAN_LIMIT / MIN} minutes and was stopped` : (e2 || err.message).trim().split('\n').slice(-3).join(' '))) : resolve(out)
+    )
+  )
+function finishScan(spec, out) {
+  const norm = (x) => (SCAN_SEV.includes(String(x || '').toUpperCase()) ? String(x).toUpperCase() : 'UNKNOWN')
+  const items = []
+  let j
+  try { j = JSON.parse(out) } catch { throw new Error(`${spec.tool} returned output DockDesk could not read`) }
+  if (spec.tool === 'trivy') {
+    for (const r of j.Results || []) for (const v of r.Vulnerabilities || [])
+      items.push({ id: v.VulnerabilityID, pkg: v.PkgName, version: v.InstalledVersion, fixed: v.FixedVersion || '', severity: norm(v.Severity), title: v.Title || '', target: r.Target })
+  } else {
+    for (const m of j.matches || [])
+      items.push({ id: m.vulnerability.id, pkg: m.artifact.name, version: m.artifact.version, fixed: (m.vulnerability.fix?.versions || []).join(', '), severity: norm(m.vulnerability.severity), title: m.vulnerability.description || '', target: m.artifact.type || '' })
+  }
+  items.sort((a, b) => SCAN_SEV.indexOf(a.severity) - SCAN_SEV.indexOf(b.severity) || a.pkg.localeCompare(b.pkg))
+  const counts = Object.fromEntries(SCAN_SEV.map((k) => [k, items.filter((i) => i.severity === k).length]))
+  return { tool: spec.tool, at: Date.now(), counts, total: items.length, items: items.slice(0, 2000).map((i) => ({ ...i, title: i.title.slice(0, 300) })) }
+}
+const scanFile = (id) => {
+  const key = String(id).replace(/^sha256:/, '')
+  if (!/^[a-f0-9]{12,64}$/.test(key)) return null // only image ids are saved; a name like nginx:latest can point at a different image tomorrow
+  return path.join(SCAN_DIR, `${key}.json`)
+}
+function readScan(id) {
+  const f = scanFile(id)
+  if (!f) return null
+  try { return JSON.parse(fs.readFileSync(f, 'utf8')) } catch { return null }
+}
+function saveScan(id, result) {
+  const f = scanFile(id)
+  if (!f) return
+  try {
+    fs.mkdirSync(SCAN_DIR, { recursive: true, mode: 0o700 })
+    fs.writeFileSync(f, JSON.stringify(result), { mode: 0o600 })
+    const all = fs.readdirSync(SCAN_DIR).filter((n) => n.endsWith('.json')).map((n) => ({ n, t: fs.statSync(path.join(SCAN_DIR, n)).mtimeMs })).sort((a, b) => b.t - a.t)
+    for (const o of all.slice(SCAN_KEEP)) fs.unlink(path.join(SCAN_DIR, o.n), () => {})
+  } catch {} // history is a convenience; never fail a scan over it
+}
+
 const handlers = {
   ping: async () => { await dk('GET', '/_ping'); return true },
   info: () => dk('GET', '/info'),
@@ -585,31 +694,17 @@ const handlers = {
     } catch (e) { return { update: null, reason: e.message } }
   },
   // Vulnerability scan with Trivy or Grype, whichever is installed (neither is bundled). Output is normalised to one shape.
+  // The page uses the cancellable /stream/scan; this call is the same scan without progress.
   'scan.tool': async () => {
-    for (const t of ['trivy', 'grype']) { try { await run(t, ['--version']); return t } catch {} }
+    for (const t of ['trivy', 'grype']) { try { await run(t, ['--version'], undefined, 15000); return t } catch {} }
     return null
   },
   'image.scan': async (ref) => {
-    ref = String(ref || '')
-    if (!/^[a-zA-Z0-9][a-zA-Z0-9._:\/@-]{0,255}$/.test(ref)) throw new Error('Invalid image reference')
-    const tool = await handlers['scan.tool']()
-    if (!tool) throw new Error('Install Trivy or Grype to scan images (for example: sudo apt install trivy)')
-    const SEV = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'UNKNOWN']
-    const norm = (x) => (SEV.includes(String(x || '').toUpperCase()) ? String(x).toUpperCase() : 'UNKNOWN')
-    const items = []
-    if (tool === 'trivy') {
-      const j = JSON.parse(await runQuiet('trivy', ['image', '--quiet', '--format', 'json', '--scanners', 'vuln', ref]))
-      for (const r of j.Results || []) for (const v of r.Vulnerabilities || [])
-        items.push({ id: v.VulnerabilityID, pkg: v.PkgName, version: v.InstalledVersion, fixed: v.FixedVersion || '', severity: norm(v.Severity), title: v.Title || '', target: r.Target })
-    } else {
-      const j = JSON.parse(await runQuiet('grype', [ref, '-o', 'json', '-q']))
-      for (const m of j.matches || [])
-        items.push({ id: m.vulnerability.id, pkg: m.artifact.name, version: m.artifact.version, fixed: (m.vulnerability.fix?.versions || []).join(', '), severity: norm(m.vulnerability.severity), title: m.vulnerability.description || '', target: m.artifact.type || '' })
-    }
-    items.sort((a, b) => SEV.indexOf(a.severity) - SEV.indexOf(b.severity) || a.pkg.localeCompare(b.pkg))
-    const counts = Object.fromEntries(SEV.map((k) => [k, items.filter((i) => i.severity === k).length]))
-    return { tool, counts, total: items.length, items: items.slice(0, 2000).map((i) => ({ ...i, title: i.title.slice(0, 300) })) }
+    const spec = await scanSpec(ref)
+    return finishScan(spec, await runScan(spec))
   },
+  // Last saved scan of an image (by image id), or null.
+  'scan.last': (id) => readScan(id),
   'image.inspect': (id) => dk('GET', `/images/${seg(id)}/json`),
   'image.remove': (id, force) => dk('DELETE', `/images/${seg(id)}?force=${!!force}`),
   'images.prune': (all) => dk('POST', `/images/prune?filters=${filters({ dangling: [all ? 'false' : 'true'] })}`),
@@ -655,7 +750,7 @@ const handlers = {
     const verbs = { up: ['up', '-d'], down: ['down'], stop: ['stop'], start: ['start'], restart: ['restart'], pull: ['pull'], build: ['build'] }
     if (!verbs[action]) throw new Error('bad action')
     const args = ['compose', '-p', project, ...(await composeFileArgs(files)), ...profileArgs(profiles)]
-    return run('docker', [...args, ...verbs[action]], workdir || undefined).catch((e) => { throw new Error(friendlyCompose(e.message)) })
+    return run('docker', [...args, ...verbs[action]], workdir || undefined, 30 * MIN).catch((e) => { throw new Error(friendlyCompose(e.message)) })
   },
   // One service of a project: restart, stop, start, pull, build, or scale to n containers.
   'compose.service': async (project, workdir, files, service, action, n) => {
@@ -670,7 +765,7 @@ const handlers = {
     } else if (verbs[action]) tail = [...verbs[action], service]
     else throw new Error('bad action')
     const args = ['compose', '-p', project, ...(await composeFileArgs(files))]
-    return run('docker', [...args, ...tail], workdir && path.isAbsolute(workdir) ? workdir : undefined).catch((e) => { throw new Error(friendlyCompose(e.message)) })
+    return run('docker', [...args, ...tail], workdir && path.isAbsolute(workdir) ? workdir : undefined, 30 * MIN).catch((e) => { throw new Error(friendlyCompose(e.message)) })
   },
   // Profiles declared in a compose file.
   'compose.profiles': async (file) => {
@@ -872,7 +967,7 @@ const handlers = {
     if (!u) throw new Error('That is not a regular local user')
     if (u.gid === g.gid) throw new Error('docker is this user\'s primary group; change it with usermod')
     if (g.members.includes(u.name) === member) return 'unchanged'
-    await run('pkexec', ['gpasswd', member ? '-a' : '-d', u.name, 'docker'])
+    await run('pkexec', ['gpasswd', member ? '-a' : '-d', u.name, 'docker'], undefined, 5 * MIN)
     return 'ok'
   },
   // Group membership is fixed at login, so a user who was just added to `docker` has no access until they log in again.
@@ -936,6 +1031,30 @@ const handlers = {
   },
   'app.info': () => ({ version: VERSION, install: installKind() }),
   // Asks the npm registry for the newest published version. Only runs when you press the button (or the daily check is on).
+  // Downloads the new .deb (or .tar.gz) from the GitHub release, checks it against SHA256SUMS and the build attestation, and saves it. Installs nothing.
+  'update.download': async () => {
+    const kind = installKind()
+    if (kind !== 'deb' && kind !== 'script') throw new Error(kind === 'npm' ? 'npm checks what it installs: update with npm install -g dockdesk@latest' : 'A source checkout is updated with git pull')
+    const v = String((await fetchJson(UPDATE_URL)).version || '')
+    if (!/^\d+\.\d+\.\d+$/.test(v)) throw new Error('Unexpected answer from the update server') // also keeps anything odd out of the download address
+    if (!isNewer(v, VERSION)) throw new Error(`You already have the latest version (${VERSION})`)
+    const name = kind === 'deb' ? `dockdesk_${v}_all.deb` : `dockdesk-${v}.tar.gz`
+    const base = `${RELEASE_BASE}/v${v}`
+    const sums = (await downloadRelease(`${base}/SHA256SUMS`, 64 * 1024)).toString('utf8')
+    const want = sums.split('\n').map((l) => /^([a-f0-9]{64}) [ *](\S+)$/.exec(l.trim())).find((m) => m && m[2] === name)?.[1]
+    if (!want) throw new Error(`SHA256SUMS of release v${v} does not list ${name}`)
+    const data = await downloadRelease(`${base}/${name}`, 16 << 20)
+    const got = crypto.createHash('sha256').update(data).digest('hex')
+    if (got !== want) throw new Error(`The downloaded file does not match its published checksum, so it was not saved. Expected ${want.slice(0, 16)}…, got ${got.slice(0, 16)}…`)
+    fs.mkdirSync(UPDATES_DIR, { recursive: true, mode: 0o700 })
+    for (const old of fs.readdirSync(UPDATES_DIR)) fs.rmSync(path.join(UPDATES_DIR, old), { force: true }) // only the newest download is kept
+    const dest = path.join(UPDATES_DIR, name)
+    fs.writeFileSync(dest + '.part', data, { mode: 0o600 }); fs.renameSync(dest + '.part', dest)
+    const attestation = await verifyAttestation(dest)
+    if (attestation.state === 'failed') { fs.rmSync(dest, { force: true }); throw new Error(`The build attestation of ${name} did not verify, so the file was removed: ${attestation.reason}`) }
+    const install = kind === 'deb' ? `sudo apt install ${dest}` : `tar xzf ${dest} -C ${UPDATES_DIR} && ${UPDATES_DIR}/dockdesk-${v}/install.sh`
+    return { version: v, file: dest, name, sha256: got, attestation, install }
+  },
   'update.check': async () => {
     const j = await fetchJson(UPDATE_URL)
     const latest = String(j.version || '')
@@ -1081,7 +1200,7 @@ async function stream(kind, q, req, res) {
       proc.stderr.on('data', (c) => { const t = d2.write(c); seen = (seen + t).slice(-2000); send('data', t) })
       proc.on('error', (e) => send('error', e.message))
       proc.on('close', (code) => { code === 0 ? send('end') : send('error', COMPOSE_MISSING.test(seen) ? friendlyCompose(seen) : `docker compose ${verb} failed (exit code ${code})`); res.end() })
-      cleanups.push(() => proc.kill('SIGTERM'))
+      cleanups.push(() => killProc(proc))
     } else if (kind === 'save') {
       // docker save -> a .tar file in a folder the user picked (written 0600: images can contain secrets)
       const ref = String(q.ref || '')
@@ -1129,7 +1248,7 @@ async function stream(kind, q, req, res) {
       proc.stderr.on('data', (c) => send('data', d2.write(c)))
       proc.on('error', (e) => send('error', e.message))
       proc.on('close', (code) => { code === 0 ? send('end') : send('error', `Push failed (exit code ${code})`); res.end() })
-      cleanups.push(() => proc.kill('SIGTERM'))
+      cleanups.push(() => killProc(proc))
     } else if (kind === 'build') {
       // Uses the docker CLI (BuildKit, .dockerignore and caching behave exactly as on the command line). No shell involved.
       const dir = path.resolve(String(q.dir || ''))
@@ -1145,7 +1264,27 @@ async function stream(kind, q, req, res) {
       proc.stderr.on('data', (c) => send('data', d2.write(c)))
       proc.on('error', (e) => send('error', e.message))
       proc.on('close', (code) => { code === 0 ? send('end') : send('error', `Build failed (exit code ${code})`); res.end() })
-      cleanups.push(() => proc.kill('SIGTERM'))
+      cleanups.push(() => killProc(proc))
+    } else if (kind === 'scan') {
+      // Scanner output (database download, progress) goes to the page as it arrives; closing the page or pressing Cancel stops the scanner.
+      const spec = await scanSpec(q.ref)
+      const id = String(q.id || '')
+      const proc = spawn(spec.tool, spec.args, { stdio: ['ignore', 'pipe', 'pipe'] })
+      const chunks = []; let size = 0, over = false, timedOut = false
+      const d2 = new StringDecoder('utf8')
+      proc.stdout.on('data', (c) => { size += c.length; if (size > 256 << 20) { over = true; killProc(proc) } else chunks.push(c) })
+      proc.stderr.on('data', (c) => { const t = d2.write(c).trim(); if (t) send('data', t.split(/\r|\n/).filter(Boolean).slice(-1)[0].slice(0, 300)) })
+      const limit = setTimeout(() => { timedOut = true; killProc(proc) }, SCAN_LIMIT)
+      proc.on('error', (e) => { clearTimeout(limit); send('error', e.message); res.end() })
+      proc.on('close', (code) => {
+        clearTimeout(limit)
+        if (timedOut) send('error', `The scan did not finish within ${SCAN_LIMIT / MIN} minutes and was stopped`)
+        else if (over) send('error', 'The scanner produced too much output')
+        else if (code !== 0) send('error', `${spec.tool} failed (exit code ${code})`)
+        else { try { const r = finishScan(spec, Buffer.concat(chunks).toString()); saveScan(id, r); send('end', r) } catch (e) { send('error', e.message) } }
+        res.end()
+      })
+      cleanups.push(() => { clearTimeout(limit); killProc(proc) })
     } else if (kind === 'shell') {
       // Host shell on a real pty via a tiny python helper (no native Node modules needed).
       const proc = spawn('python3', [path.join(__dirname, 'pty-shell.py')], { stdio: ['pipe', 'pipe', 'inherit'], cwd: os.homedir() })
@@ -1317,14 +1456,36 @@ function makeLaunchFile(url) {
 const dropLaunchFile = () => { if (launchFile) { try { fs.unlinkSync(launchFile) } catch {} launchFile = null } }
 process.on('exit', dropLaunchFile)
 
+// Every run gets its own throwaway browser profile (cache/dockdesk/profile-<pid>). With one shared profile, starting a second copy
+// (say `npx dockdesk` next to the installed app) is handed to the browser that is already running: the new browser command exits at
+// once, this server concludes "the window was closed" and quits, and the handed-over window opens a launch page that no longer exists
+// ("ERR_FILE_NOT_FOUND"). The same shared profile also let Chromium reopen windows of a run that was killed with Ctrl+C.
+// Nothing needs to persist in the profile: the app keeps no state there that survives a restart anyway (the port changes every run).
+const PROFILE_ROOT = path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache'), 'dockdesk')
+const profileDir = path.join(PROFILE_ROOT, `profile-${process.pid}`)
+const pidAlive = (pid) => { try { process.kill(pid, 0); return true } catch (e) { return e.code === 'EPERM' } }
+// Remove profiles left behind by runs that no longer exist (killed, crashed or power loss). The old shared "profile" folder is not touched.
+function sweepOldProfiles() {
+  let names = []
+  try { names = fs.readdirSync(PROFILE_ROOT) } catch { return }
+  for (const n of names) {
+    const m = /^profile-(\d+)$/.exec(n)
+    if (m && Number(m[1]) !== process.pid && !pidAlive(Number(m[1]))) fs.rm(path.join(PROFILE_ROOT, n), { recursive: true, force: true }, () => {})
+  }
+}
+const dropProfile = () => { try { fs.rmSync(profileDir, { recursive: true, force: true }) } catch {} }
+process.on('exit', dropProfile)
+// Ctrl+C / kill: leave through the normal exit path so the launch file and the profile are cleaned up (the window gets the same signal from the terminal).
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, () => process.exit(0))
+
 let appWindow = null
 function openApp(url) {
   const target = 'file://' + makeLaunchFile(url)
   const browsers = ['chromium', 'chromium-browser', 'google-chrome', 'brave-browser', 'microsoft-edge']
-  const profile = path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache'), 'dockdesk', 'profile')
+  sweepOldProfiles()
   const tryNext = (i) => {
     if (i >= browsers.length) return execFile('xdg-open', [target], () => {})
-    const child = appWindow = execFile(browsers[i], [`--app=${target}`, '--class=DockDesk', '--no-first-run', `--user-data-dir=${profile}`], () => {})
+    const child = appWindow = execFile(browsers[i], [`--app=${target}`, '--class=DockDesk', '--no-first-run', `--user-data-dir=${profileDir}`], () => {})
     child.on('error', () => tryNext(i + 1))
     // When the app window closes, shut the server down so nothing lingers in the background.
     // With the tray icon on, the server keeps running in the tray instead, and the tray's Open entry brings the window back.

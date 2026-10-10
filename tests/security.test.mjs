@@ -3,7 +3,7 @@ import { describe, it, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import http from 'node:http'
 import { spawn, execFileSync } from 'node:child_process'
-import { statSync, readdirSync, readFileSync, existsSync, mkdirSync } from 'node:fs'
+import { statSync, readdirSync, readFileSync, existsSync, mkdirSync, writeFileSync, symlinkSync } from 'node:fs'
 import { userInfo } from 'node:os'
 import { join } from 'node:path'
 import { startServer, janitor, shim, waitFor, sleep, ROOT } from './helpers.mjs'
@@ -91,6 +91,49 @@ describe('launch token never reaches a command line', () => {
     const r = await fetch(url)
     assert.equal(r.status, 200)
     await waitFor(() => !existsSync(launchPath), { what: 'launch file removal' })
+  })
+})
+
+describe('every run gets its own browser profile', () => {
+  let J
+  before(() => { J = janitor() })
+  after(() => J.cleanup())
+  // Starts the server with a stand-in browser and returns what the browser was given.
+  const launch = async (dir, cache = join(dir, 'cache')) => {
+    const runDir = join(dir, 'run'); mkdirSync(runDir, { recursive: true, mode: 0o700 })
+    const fake = shim(dir, 'chromium', { body: 'sleep 20' })
+    const proc = spawn('node', [join(ROOT, 'server.js')], { env: { ...process.env, PATH: fake.bin + ':' + process.env.PATH, XDG_RUNTIME_DIR: runDir, XDG_CACHE_HOME: cache, DOCKDESK_NO_OPEN: '' }, stdio: 'ignore' })
+    const args = await waitFor(() => (existsSync(fake.log) ? readFileSync(fake.log, 'utf8') : ''), { what: 'the browser to be launched' })
+    return { proc, args, profile: /--user-data-dir=(.+)/.exec(args)?.[1], exited: new Promise((ok) => proc.on('exit', (code) => ok(code))) }
+  }
+  it('uses a folder named after the server process, so two copies can never share (or be handed to) one browser', async () => {
+    const cache = join(J.tmp('cache'), 'c')
+    const a = await launch(J.tmp('a'), cache), b = await launch(J.tmp('b'), cache)
+    try {
+      assert.equal(a.profile, join(cache, 'dockdesk', `profile-${a.proc.pid}`)); assert.equal(b.profile, join(cache, 'dockdesk', `profile-${b.proc.pid}`))
+      assert.notEqual(a.profile, b.profile)
+    } finally { a.proc.kill('SIGTERM'); b.proc.kill('SIGTERM') }
+  })
+  it('removes its profile when it stops, also on Ctrl+C / kill, and exits cleanly', async () => {
+    const dir = J.tmp('gone'), { proc, profile, exited } = await launch(dir)
+    mkdirSync(profile, { recursive: true }); writeFileSync(join(profile, 'x'), 'x') // what the browser would have created
+    proc.kill('SIGINT')
+    assert.equal(await exited, 0)
+    assert.ok(!existsSync(profile), 'the throwaway profile is deleted')
+  })
+  it('sweeps profiles of runs that are gone, and nothing else', async () => {
+    const dir = J.tmp('sweep'), cache = join(dir, 'cache'), root = join(cache, 'dockdesk')
+    const mk = (n) => { mkdirSync(join(root, n), { recursive: true }); writeFileSync(join(root, n, 'f'), 'x') }
+    for (const n of ['profile-2147483000', `profile-${process.pid}`, 'profile', 'profile-abc', 'profile-1x']) mk(n) // dead run, live run (this test process), the old shared profile, two lookalikes
+    const { proc } = await launch(dir, cache)
+    try {
+      await waitFor(() => !existsSync(join(root, 'profile-2147483000')), { what: 'the dead run\'s profile to be removed' })
+      for (const n of [`profile-${process.pid}`, 'profile', 'profile-abc', 'profile-1x']) assert.ok(existsSync(join(root, n, 'f')), `${n} must be left alone`)
+    } finally { proc.kill('SIGTERM') }
+  })
+  it('copes with a cache folder that does not exist yet', async () => {
+    const { proc, args } = await launch(J.tmp('fresh'))
+    try { assert.match(args, /--app=file:\/\//) } finally { proc.kill('SIGTERM') }
   })
 })
 

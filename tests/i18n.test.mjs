@@ -1,14 +1,15 @@
 // Translations: every language covers every string the app asks for, and keeps the {placeholders}. No Docker or browser needed.
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..', 'public')
 // public/i18n.js is an ES module loaded by the browser; the package is not marked "type": "module", so older Node versions refuse to import it by path. A data: URL works everywhere.
 const { TR, LANGS } = await import('data:text/javascript;base64,' + readFileSync(join(root, 'i18n.js')).toString('base64'))
-const app = readFileSync(join(root, 'app.js'), 'utf8')
+// the page code is app.js plus one file per area in app/
+const app = [join(root, 'app.js'), ...readdirSync(join(root, 'app')).filter((f) => f.endsWith('.js')).map((f) => join(root, 'app', f))].map((f) => readFileSync(f, 'utf8')).join('\n')
 
 // every English string handed to tr('…') or listed in a ternary inside tr(…)
 const used = new Set()
@@ -26,18 +27,27 @@ describe('translations', () => {
     assert.deepEqual(Object.keys(LANGS).sort(), Object.keys(TR).sort())
   })
   it('the app really uses translatable strings', () => assert.ok(used.size > 80, `only ${used.size} strings found`))
+  const keys = Object.keys(TR.es)
+  it('has hundreds of strings, beyond the few that go through tr()', () => assert.ok(keys.length > 600, `only ${keys.length} strings`))
   for (const lang of Object.keys(TR).filter((l) => l !== 'en')) {
-    it(`${LANGS[lang]} translates every string, and nothing stale`, () => {
-      const missing = [...used].filter((k) => !(k in TR[lang]))
-      assert.deepEqual(missing, [], `missing in ${lang}`)
-      assert.deepEqual(Object.keys(TR[lang]).filter((k) => !used.has(k)), [], `unused keys in ${lang}`)
+    it(`${LANGS[lang]} translates every string that tr() asks for`, () => {
+      assert.deepEqual([...used].filter((k) => !(k in TR[lang])), [], `missing in ${lang}`)
     })
-    it(`${LANGS[lang]} keeps the placeholders and has no empty text`, () => {
+    it(`${LANGS[lang]} has exactly the same strings as the other languages`, () => {
+      assert.deepEqual(Object.keys(TR[lang]).sort(), [...keys].sort())
+    })
+    it(`${LANGS[lang]} keeps the placeholders and tags and has no empty text`, () => {
+      const ph = (x) => [...x.matchAll(/\{(\w+)\}/g)].map((m) => m[1]).sort().join(',')
+      const tags = (x) => [...x.matchAll(/<\/?\w+[^>]*>/g)].map((m) => m[0]).sort().join('')
       for (const [k, v] of Object.entries(TR[lang])) {
         assert.ok(v.trim(), `empty translation for "${k}"`)
-        const ph = (x) => [...x.matchAll(/\{(\w+)\}/g)].map((m) => m[1]).sort().join(',')
         assert.equal(ph(v), ph(k), `placeholders differ for "${k}"`)
+        assert.equal(tags(v), tags(k), `tags differ for "${k}"`)
       }
+    })
+    it(`${LANGS[lang]} really translates (most strings differ from English)`, () => {
+      const same = keys.filter((k) => TR[lang][k] === k).length
+      assert.ok(same < keys.length * 0.25, `${same} of ${keys.length} strings are still English in ${lang}`)
     })
   }
 })

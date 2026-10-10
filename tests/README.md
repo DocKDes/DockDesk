@@ -7,6 +7,7 @@ npm test                  # everything that can run on this machine
 npm run test:security     # access control, token handling, input validation (no Docker needed for most)
 npm run test:api          # the server against a real Docker engine
 npm run test:ui           # the real UI in headless Chromium
+npm run lint              # ESLint (fetched with npx; the app itself has no dependencies)
 npm run test:registry     # opt-in: sign in / tag / push against a local password-protected registry
 node tests/run.mjs api    # same as test:api; any file-name prefix works
 ```
@@ -20,6 +21,12 @@ Tests that can't run here are **skipped with a reason**, never failed: no Docker
 | `security.test.mjs` | Token required everywhere, foreign `Host`/`Origin` refused, no path traversal, the launch token never appears on a command line (a stand-in browser records exactly what it receives), launch file is `0600` and deleted on first use, every validated input is refused before anything privileged runs, docker-group changes only ever go through `pkexec` with a fixed argument list (a stand-in `pkexec` records it) |
 | `api.test.mjs` | Engine info/events/history, container run options verified with `docker inspect`, lifecycle, live updates, volumes and networks, image history/tag/build/export/import round trip, container file listing/preview/download/upload (byte-for-byte checks), log download/stream, compose validate/save/read/write rules and a real up/edit/down cycle |
 | `ui.test.mjs` | Every page renders, sidebar order, Overview, search, all container drawer tabs, log viewer (colours, search, filter, download), file browser (including upload), command palette, compose editor validation, run dialog, layers view, Activity, Labs, Settings; fails on any uncaught JavaScript error |
+| `static.test.mjs` | No Docker or browser needed: every source file parses, shell and Python helpers are valid, the files the page imports exist, the changelog matches the version, CI workflows declare permissions and pin their actions |
+| `i18n.test.mjs` | Every language has the same phrases, keeps `{placeholders}` and tags, has no empty text, and covers everything `tr()` asks for. The real pages in French (nothing left in English, data untouched, English comes back) are checked in `ui.test.mjs` |
+| `update.test.mjs` | "Download and verify" against a stand-in release server (no internet): checksum must match `SHA256SUMS`, bad or oversized files and redirects away from GitHub are refused, only `x.y.z` versions build the address, the file is saved 0600, nothing is installed |
+| `scan.test.mjs` | Vulnerability scans with a stand-in Trivy: progress streaming, normalised results, saved last result (0600, by image id only), invalid references refused, cancelling stops the scanner |
+| `package.test.mjs` | The `.deb` and release tarball (contents, dependency names per distro, install.sh into a temp home, npm package metadata) |
+| `a11y.test.mjs` | Contrast ratios of the theme colours (both themes), focus ring, reduced-motion rule, landmarks. The keyboard and dialog-focus behaviour is checked in `ui.test.mjs` |
 | `registry.test.mjs` | Opt-in. Real sign-in, push, catalog check and sign-out; proves the password is never returned or written in clear |
 
 ## Browser tests and environment variables
@@ -45,3 +52,15 @@ If the browser can't start, the UI tests **skip with the reason** on a normal ma
 ## Adding a test
 
 Use `startServer()` from `helpers.mjs` (random port, real server), `janitor()` for temp dirs and cleanup, and name anything you create with `PREFIX`. For UI tests, `openPage()` gives `eval`, `click`, `set`, `waitFor`… and records uncaught page errors in `page.exceptions`. Prefer `waitFor(...)` over fixed sleeps.
+
+## What CI runs (`.github/workflows/`)
+
+| Job | What it covers |
+|---|---|
+| `static` | `static`, `i18n`, `a11y`, `scan`, `update` and `package` tests, `eslint` (undefined names and unused imports across the page modules, server and tests) and `shellcheck` on every shell script (no Docker, about a minute) |
+| `test` | The whole suite on Ubuntu 24.04 and 22.04 with Node 22, and on Node 20 and 18 (the browser tests need Node 22). `CI=true`, so a browser that cannot start fails instead of skipping |
+| `registry-and-network` | The opt-in tests: a local password-protected registry, and Docker Hub search |
+| `package` / `install-deb` | Builds the release, checks its checksums and `npm pack`, then installs the `.deb` on Debian 12, Debian 13, Ubuntu 24.04 and Kali with only its required dependencies, starts it (`packaging/smoke-test.sh`) and removes it |
+| `CodeQL` | Static security analysis of the JavaScript and Python (separate workflow, also weekly) |
+
+CI also runs every Monday, so a new Docker, Chrome or Node release that breaks something shows up without a push. Dependabot keeps the actions current. The release workflow refuses to publish unless `CHANGELOG.md` has a section for the tagged version, and smoke-tests the built release.

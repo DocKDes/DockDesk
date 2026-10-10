@@ -1,0 +1,7 @@
+# The app has no npm dependencies; only the GitHub Actions the workflows use need keeping current.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
