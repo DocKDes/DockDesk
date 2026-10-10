@@ -81,7 +81,7 @@ jobs:
       - run: sh packaging/release.sh
       - run: (cd dist/release && sha256sum -c SHA256SUMS)
       - run: npm pack --dry-run
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release
           path: dist/release/
