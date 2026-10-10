@@ -325,7 +325,8 @@ describe('DockDesk UI in a real browser', { skip }, () => {
     await page.set('#cmpb', IMG, ['change']); await page.click('#cmpgo'); assert.match(await page.text('#cmpout'), /Pick two different images/)
     await reset()
     await page.click('[data-call*=imgupdates]') // images built or loaded locally cannot be checked: it must finish quietly
-    await page.waitFor(`/up to date|update/.test(document.querySelector('#toast').textContent)`)
+    // every tagged image on this machine is asked of its registry, so this depends on the network and how many images exist
+    await page.waitFor(`/up to date|update/.test(document.querySelector('#toast').textContent)`, { timeout: 90000 })
   })
 
   it('files tab: edit a text file in place and keep its permissions', async () => {
@@ -439,6 +440,44 @@ describe('DockDesk UI in a real browser', { skip }, () => {
     await page.eval('window.confirm = () => true')
   })
 
+  it('language: the whole interface is translated (not only menus), data stays as it is, and English comes back', async () => {
+    try {
+      const left = () => page.eval(`import('/translate.js').then((m)=>{const u=m.untranslated();return [...u.text,...u.attr].filter((t)=>/^[A-Z][a-z]+(\\s+\\S+)*$/.test(t)&&!/${PREFIX}|^(CPU|RAM|Docker|DockDesk|Ctrl|Shift|Enter|Esc|Kali|Mutillidae)\\b/.test(t)&&!/^[A-Z][a-z]{2} \\d/.test(t))})`)
+      await nav('settings')
+      await page.waitFor(`!!document.querySelector('select[data-setting=lang]')`)
+      await page.set('select[data-setting=lang]', 'fr', ['change'])
+      await page.waitFor(`document.querySelector('#nav [data-p=containers]').textContent.trim() === 'Conteneurs'`)
+      // every page, plus a container drawer, the Run dialog and a menu: nothing user-facing is left in English
+      const seen = {}
+      const navL = async (p) => { await page.click(`#nav [data-p=${p}]`); await page.waitFor(`document.querySelector('#nav a.on')?.dataset.p === '${p}'`); await new Promise((r) => setTimeout(r, 900)) }
+      for (const p of PAGES) { await navL(p); seen[p] = await left() }
+      await navL('containers'); await page.eval(`[...document.querySelectorAll('#rows tr')].find(r=>r.textContent.includes('${main}')).click()`); await page.waitFor(`!!document.querySelector('.detail .tabs')`); for (const t of ['Logs', 'Stats', 'Files', 'Settings', 'Inspect']) { await page.eval(`[...document.querySelectorAll('.detail .tabs a')].find(a=>a.dataset.t==='${t}')?.click()`); await new Promise((r) => setTimeout(r, 600)); seen['drawer ' + t] = await left() }
+      await reset()
+      await navL('images'); await page.waitFor(`document.querySelectorAll('#irows tr [data-call*=run]').length > 0`)
+      await page.eval(`document.querySelector('#irows tr [data-call*=run]').click()`); await page.waitFor(`!!document.querySelector('details.adv')`)
+      await page.eval(`document.querySelector('details.adv').open = true`); seen['run dialog'] = await left(); await reset()
+      const leftover = Object.fromEntries(Object.entries(seen).filter(([, v]) => v.length))
+      assert.deepEqual(leftover, {}, 'untranslated text in French')
+      // translated through patterns and nested values
+      await navL('containers'); await page.waitFor(`[...document.querySelectorAll('#rows tr')].some(r=>r.textContent.includes('${main}'))`)
+      assert.match(await page.text('#page'), /Actif|Arrêté|En cours|il y a|Il y a/i, 'container status and ages are translated')
+      // native dialogs go through the same dictionary
+      assert.equal(await page.eval(`import('/translate.js').then((m)=>m.translateString('Delete 2 container(s)?'))`), 'Supprimer 2 conteneur(s) ?')
+      // data is left alone: the fixture container keeps its name
+      assert.ok(await page.eval(`[...document.querySelectorAll('#rows tr')].some(r=>r.textContent.includes('${main}'))`))
+      // and switching back restores the English text everywhere
+      await navL('settings'); await page.set('select[data-setting=lang]', 'en', ['change'])
+      await page.waitFor(`document.querySelector('#nav [data-p=containers]').textContent.trim() === 'Containers'`)
+      await navL('containers'); await page.waitFor(`/Only show stopped/.test(document.querySelector('#page').textContent)`)
+      assert.equal(await page.eval(`(document.documentElement.lang)`), 'en')
+      await page.eval(`(()=>{const s=JSON.parse(localStorage.getItem('settings'));s.lang='auto';localStorage.setItem('settings',JSON.stringify(s))})()`)
+    } finally {
+      await page.click('#nav [data-p=settings]'); await page.waitFor(`!!document.querySelector('select[data-setting=lang]')`)
+      await page.set('select[data-setting=lang]', 'auto', ['change'])
+      await page.waitFor(`document.querySelector('#nav [data-p=containers]').textContent.trim() === 'Containers'`)
+    }
+  })
+
   it('updates: checking shows the new version, the install command and a pill in the status bar', async () => {
     await nav_('settings')
     await page.waitFor(`!!document.querySelector('[data-call*=checkupdate]')`)
@@ -491,8 +530,72 @@ describe('DockDesk UI in a real browser', { skip }, () => {
     await upload('z.json', JSON.stringify({ app: 'other', format: 1, settings: {} })); await page.waitFor(`/not a DockDesk settings file/.test(document.querySelector('#toast').textContent)`)
     await page.eval(`localStorage.removeItem('runPresets')`)
     await page.click('[data-call*=resetsettings]'); await page.waitFor(`JSON.parse(localStorage.getItem('settings')).refresh === 3`)
+    await page.eval(`delete HTMLAnchorElement.prototype.click`) // the backup test replaced <a>.click() to capture the download; give it back to the tests after it
   })
 
+  it('accessibility: landmarks, names, keyboard use of rows and nav, dialog focus, menus', async () => {
+    await reset()
+    // landmarks and the live message area
+    assert.equal(await page.eval(`document.querySelector('#nav').getAttribute('aria-label')`), 'Main')
+    assert.equal(await page.eval(`document.querySelector('#toast').getAttribute('aria-live')`), 'polite')
+    // every control on every page has a name (button text, aria-label, label)
+    const unnamed = `(()=>{const vis=(e)=>{const r=e.getBoundingClientRect();return r.width>0&&r.height>0}
+      const nm=(e)=>(e.getAttribute('aria-label')||e.textContent||e.title||'').trim()
+      const bad=[...document.querySelectorAll('button,a[href]')].filter(vis).filter((e)=>!nm(e)).map((e)=>e.className)
+      for(const e of [...document.querySelectorAll('input:not([type=hidden]),select,textarea')].filter(vis)) if(!(e.closest('label')||e.getAttribute('aria-label')||e.getAttribute('aria-labelledby')||(e.id&&document.querySelector('label[for="'+e.id+'"]')))) bad.push(e.tagName+'#'+e.id+'.'+e.className)
+      return bad})()`
+    for (const p of PAGES) { await nav(p); await page.waitFor('true'); assert.deepEqual(await page.eval(unnamed), [], `${p}: controls without a name`) }
+    // sidebar: focusable, current page marked, Enter navigates
+    await nav('dashboard')
+    assert.equal(await page.eval(`document.querySelector('#nav a.on').getAttribute('aria-current')`), 'page')
+    assert.equal(await page.eval(`[...document.querySelectorAll('#nav a[data-p]')].every((a)=>{a.focus();return document.activeElement===a})`), true, 'sidebar links can take focus')
+    await page.key('#nav [data-p=volumes]', 'Enter')
+    await page.waitFor(`document.querySelector('#nav a.on')?.dataset.p === 'volumes'`)
+    assert.equal(await page.eval(`document.querySelector('#nav a.on').getAttribute('aria-current')`), 'page')
+    assert.equal(await page.eval(`(()=>{const e=document.querySelector('#nav .engine');e.focus();return document.activeElement===e&&e.getAttribute('role')})()`), 'button')
+    // table rows: focusable, Enter opens the drawer, which is a labelled dialog with focus inside
+    await nav('containers')
+    await page.waitFor(`[...document.querySelectorAll('#rows tr')].some(r=>r.textContent.includes('${main}'))`)
+    assert.equal(await page.eval(`[...document.querySelectorAll('#rows tr.row-click')].every((r)=>r.tabIndex===0)`), true)
+    await page.eval(`[...document.querySelectorAll('#rows tr')].find(r=>r.textContent.includes('${main}')).focus()`)
+    await page.eval(`document.activeElement.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true}))`)
+    await page.waitFor(`!!document.querySelector('.detail .tabs')`)
+    assert.equal(await page.eval(`document.querySelector('.detail').getAttribute('role')`), 'dialog')
+    await page.waitFor(`document.querySelector('.detail').contains(document.activeElement)`)
+    assert.equal(await page.eval(`document.querySelector('.detail .tabs').getAttribute('role')`), 'tablist')
+    assert.equal(await page.eval(`document.querySelector('.detail .tabs a.on').getAttribute('aria-selected')`), 'true')
+    await page.eval(`document.querySelector('.detail .tabs a').focus()`)
+    await page.key('.detail .tabs a', 'ArrowRight')
+    await page.waitFor(`document.querySelectorAll('.detail .tabs a')[1].classList.contains('on') && document.querySelectorAll('.detail .tabs a')[1].getAttribute('aria-selected')==='true'`)
+    await reset()
+    // a modal dialog: labelled, focus moves in, Tab wraps, Esc closes and focus goes back to the button that opened it
+    await nav('images')
+    await page.waitFor(`document.querySelectorAll('#irows tr [data-call*=run]').length > 0`)
+    await page.eval(`(()=>{const b=document.querySelector('#irows tr [data-call*=run]');b.focus();b.click()})()`)
+    await page.waitFor(`!!document.querySelector('.modal .box')`)
+    assert.equal(await page.eval(`document.querySelector('.modal .box').getAttribute('role')`), 'dialog')
+    assert.equal(await page.eval(`document.querySelector('.modal .box').getAttribute('aria-modal')`), 'true')
+    assert.ok(await page.eval(`!!document.querySelector('.modal .box').getAttribute('aria-labelledby')`), 'dialog has a title reference')
+    await page.waitFor(`document.querySelector('.modal').contains(document.activeElement)`)
+    await page.eval(`(()=>{const f=[...document.querySelectorAll('.modal button,.modal input,.modal select,.modal textarea')].filter(e=>!e.disabled&&e.offsetParent&&e.type!=='hidden');f[f.length-1].focus();document.activeElement.dispatchEvent(new KeyboardEvent('keydown',{key:'Tab',bubbles:true,cancelable:true}))})()`)
+    assert.equal(await page.eval(`document.querySelector('.modal').contains(document.activeElement)`), true, 'Tab at the end wraps inside the dialog')
+    await page.eval(`document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}))`)
+    await page.waitFor(`!document.querySelector('.modal')`)
+    await page.waitFor(`document.activeElement?.matches('[data-call*=run]')`)
+    // the row menu: opens as a menu with focus on its first item; arrows move; Esc closes
+    await nav('containers')
+    await page.waitFor(`document.querySelectorAll('#rows tr [data-call*=menu]').length > 0`)
+    await page.eval(`(()=>{const b=document.querySelector('#rows tr [data-call*=menu]');b.focus();b.click()})()`)
+    await page.waitFor(`!document.querySelector('#menu').hidden && document.querySelector('#menu').contains(document.activeElement)`)
+    assert.equal(await page.eval(`document.querySelector('#menu').getAttribute('role')`), 'menu')
+    assert.equal(await page.eval(`document.activeElement.getAttribute('role')`), 'menuitem')
+    const first = await page.eval(`document.activeElement.textContent`)
+    await page.eval(`document.activeElement.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowDown',bubbles:true}))`)
+    assert.notEqual(await page.eval(`document.activeElement.textContent`), first, 'ArrowDown moves to the next item')
+    await page.eval(`document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}))`)
+    await page.waitFor(`document.querySelector('#menu').hidden`)
+    await page.waitFor(`document.activeElement?.matches('[data-call*=menu]')`)
+  })
   it('uncaught JavaScript errors: none during the whole session', () => {
     assert.deepEqual(page.exceptions, [])
   })

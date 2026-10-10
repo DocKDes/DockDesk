@@ -65,7 +65,7 @@ describe('release artifacts', { skip: haveDpkg ? false : 'dpkg-deb is not instal
   })
   it('installs licence, notices, security policy, changelog and a Debian copyright file', () => {
     const files = sh('dpkg-deb', ['-c', deb])
-    for (const f of ['usr/share/doc/dockdesk/LICENSE', 'usr/share/doc/dockdesk/THIRD_PARTY_NOTICES.md', 'usr/share/doc/dockdesk/copyright', 'usr/share/doc/dockdesk/changelog.gz', 'usr/share/doc/dockdesk/README.md', 'opt/dockdesk/server.js', 'opt/dockdesk/pty-shell.py', 'opt/dockdesk/tray.py', 'opt/dockdesk/package.json', 'opt/dockdesk/public/i18n.js', 'usr/bin/dockdesk', 'usr/share/applications/dockdesk.desktop']) assert.ok(files.includes(f), `missing ${f}`)
+    for (const f of ['usr/share/doc/dockdesk/LICENSE', 'usr/share/doc/dockdesk/THIRD_PARTY_NOTICES.md', 'usr/share/doc/dockdesk/copyright', 'usr/share/doc/dockdesk/changelog.gz', 'usr/share/doc/dockdesk/README.md', 'opt/dockdesk/server.js', 'opt/dockdesk/pty-shell.py', 'opt/dockdesk/tray.py', 'opt/dockdesk/package.json', 'opt/dockdesk/public/i18n.js', 'opt/dockdesk/public/translate.js', 'opt/dockdesk/public/a11y.js', 'opt/dockdesk/public/app/core.js', 'opt/dockdesk/public/app/shell.js', 'usr/bin/dockdesk', 'usr/share/applications/dockdesk.desktop']) assert.ok(files.includes(f), `missing ${f}`)
     assert.ok(!/\/tests\//.test(files), 'tests are not shipped'); assert.ok(!/node_modules|\.git\//.test(files))
   })
   it('the launcher in the .deb starts a working server from the installed location', async () => {

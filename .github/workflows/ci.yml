@@ -3,14 +3,45 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 5 * * 1'   # weekly: catches breakage from new Docker, Chrome or Node releases even when nobody pushed
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
+  # Fast checks that need no Docker or browser: syntax of every file, shell and Python helpers, translations, contrast, scan logic.
+  static:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node tests/run.mjs static i18n a11y scan update package
+      - name: Lint (undefined names, unused imports, common slips; the app itself has no dependencies)
+        run: npx --yes eslint@9 -c eslint.config.mjs public server.js tests
+      - name: shellcheck
+        run: shellcheck -S warning install.sh uninstall.sh bin/dockdesk packaging/*.sh
+
+  # The real suite (security, API against a real Docker engine, UI in headless Chrome).
+  # The browser tests need Node 22 and skip themselves on older versions, so 18 and 20 cover everything else.
+  test:
+    needs: static
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
-        node: [18, 20, 22]   # the browser UI tests need Node 22 and skip themselves on older versions
+        include:
+          - { os: ubuntu-24.04, node: 22 }
+          - { os: ubuntu-22.04, node: 22 }
+          - { os: ubuntu-latest, node: 20 }
+          - { os: ubuntu-latest, node: 18 }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -19,3 +50,68 @@ jobs:
       - run: docker version && docker compose version
       - run: google-chrome --version || echo 'no google-chrome on this runner'
       - run: npm test
+        env:
+          CI: 'true'   # a browser that cannot start fails the UI tests instead of skipping them (on Node 22)
+
+  # The opt-in tests: sign in / tag / push against a local registry, and Docker Hub search over the internet.
+  registry-and-network:
+    needs: static
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node tests/run.mjs registry api
+        env:
+          DD_TEST_REGISTRY: '1'
+          DD_TEST_NETWORK: '1'
+
+  # Build the release once, then install the .deb on the distributions it claims to support (this is what proves the dependency names).
+  package:
+    needs: static
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: sh packaging/release.sh
+      - run: (cd dist/release && sha256sum -c SHA256SUMS)
+      - run: npm pack --dry-run
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: dist/release/
+          retention-days: 7
+
+  install-deb:
+    needs: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # Ubuntu 22.04 is left out on purpose: its own nodejs is version 12 and the package needs 18.17 or newer (see the README)
+        image: ['debian:12', 'debian:trixie', 'ubuntu:24.04', 'kalilinux/kali-rolling']
+    container: ${{ matrix.image }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release
+          path: release
+      - name: Install the package with only its required dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ./release/dockdesk_*_all.deb
+      - uses: actions/checkout@v4
+        with:
+          path: src
+      - name: Start the installed app and check it answers
+        run: sh src/packaging/smoke-test.sh /opt/dockdesk
+      - name: Remove it again
+        run: |
+          DEBIAN_FRONTEND=noninteractive apt-get remove -y dockdesk
+          test ! -e /opt/dockdesk/server.js

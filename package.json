@@ -58,6 +58,7 @@
     "test:ui": "node tests/run.mjs ui",
     "test:registry": "DD_TEST_REGISTRY=1 node tests/run.mjs registry",
     "release": "sh packaging/release.sh",
-    "test:package": "node tests/run.mjs package"
+    "test:package": "node tests/run.mjs package",
+    "lint": "npx --yes eslint@9 -c eslint.config.mjs public server.js tests"
   }
 }
