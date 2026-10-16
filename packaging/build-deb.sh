@@ -6,6 +6,7 @@ VER=$(node -p "require('./package.json').version")
 R=dist/pkg
 rm -rf "$R" && mkdir -p "$R/usr/share/doc/dockdesk" "$R/DEBIAN" "$R/opt/dockdesk" "$R/usr/bin" "$R/usr/share/applications" "$R/usr/share/icons/hicolor/256x256/apps"
 cp -r server.js pty-shell.py tray.py package.json dockdesk-polkit.rules public "$R/opt/dockdesk/"
+rm -rf "$R/opt/dockdesk/public/docs/screenshots"
 cp public/icon.png "$R/usr/share/icons/hicolor/256x256/apps/dockdesk.png"
 cp README.md LICENSE THIRD_PARTY_NOTICES.md SECURITY.md "$R/usr/share/doc/dockdesk/"
 gzip -9n -c CHANGELOG.md > "$R/usr/share/doc/dockdesk/changelog.gz"

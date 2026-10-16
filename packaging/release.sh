@@ -11,6 +11,7 @@ T="dockdesk-$VER"
 S=$(mktemp -d)
 mkdir "$S/$T"
 cp -r server.js pty-shell.py tray.py dockdesk-polkit.rules public bin packaging install.sh uninstall.sh package.json README.md LICENSE THIRD_PARTY_NOTICES.md CHANGELOG.md SECURITY.md "$S/$T/"
+rm -rf "$S/$T/public/docs/screenshots"
 tar -C "$S" --owner=0 --group=0 -czf "$OUT/$T.tar.gz" "$T"
 rm -rf "$S"
 # name the files explicitly: with `./*` the shell could create SHA256SUMS before expanding the glob, so the list would include (and fail to verify) itself
