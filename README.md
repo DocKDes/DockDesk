@@ -1,8 +1,29 @@
-# DockDesk
+<div align="center">
+  <img src="public/icon.png" alt="DockDesk logo" width="96">
+  <h1>DockDesk</h1>
+  <p><strong>A fast, lightweight Docker Desktop alternative for Linux</strong></p>
+  <p>Manage containers, images, volumes, networks and Compose projects from a focused desktop UI over the Docker Engine you already run.</p>
+  <p>
+    <a href="https://github.com/DocKDes/DockDesk/releases"><img src="https://img.shields.io/github/v/release/DocKDes/DockDesk?display_name=tag&sort=semver&style=for-the-badge&label=release" alt="Latest release"></a>
+    <a href="https://github.com/DocKDes/DockDesk/blob/main/LICENSE"><img src="https://img.shields.io/github/license/DocKDes/DockDesk?style=for-the-badge" alt="MIT license"></a>
+    <a href="https://github.com/DocKDes/DockDesk/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/DocKDes/DockDesk/ci.yml?style=for-the-badge&label=CI" alt="CI status"></a>
+    <a href="https://www.npmjs.com/package/dockdesk"><img src="https://img.shields.io/npm/v/dockdesk?style=for-the-badge&label=npm" alt="npm package"></a>
+  </p>
+  <p>
+    <a href="#install">Install</a> ·
+    <a href="#screenshots">Screenshots</a> ·
+    <a href="#what-it-does">Features</a> ·
+    <a href="CONTRIBUTING.md">Contributing</a> ·
+    <a href="SECURITY.md">Security</a> ·
+    <a href="https://github.com/DocKDes/DockDesk/issues">Report an issue</a>
+  </p>
+</div>
 
-A small, fast Docker Desktop UI alternative for Linux (built and tested on Kali). It is a GUI over the Docker
-Engine you already run, so there is no VM and no extra daemon: **under 1 MB of source (about 540 KB of it ours, the rest is the bundled terminal), a ~250 KB `.deb`,
-zero npm dependencies** (xterm.js is bundled for the terminal).
+<p align="center">
+  <img src="public/docs/screenshots/overview.png" alt="DockDesk overview dashboard" width="100%">
+</p>
+
+> DockDesk is a local-first GUI for the Docker Engine. It does not bundle a VM or run an extra daemon, and it stays small: under 1 MB of source, a roughly 250 KB `.deb`, and zero npm runtime dependencies.
 
 ## What it does
 
@@ -20,6 +41,32 @@ zero npm dependencies** (xterm.js is bundled for the terminal).
 | **Activity** | The last 6 hours of Docker events plus a live feed, with search, type filter, a problems-only view and links to the container or image; the UI refreshes on change instead of polling hard |
 | **Accessibility** | Fully keyboard-operable (rows, tabs, menus, dialogs with focus handling, skip link, visible focus ring), screen-reader names and landmarks, 4.5:1 text contrast in both themes, honours reduced motion |
 | **Settings** | Theme, language (English, Spanish, French, German, Hindi; the whole app, not only the menus), refresh rate, crash and CPU/memory alerts, keyboard shortcuts (`?`, and `g` then a letter to jump to a page), update check with **Download and verify** for `.deb`/`install.sh` installs, optional system tray icon, export/import of settings and Run presets, registry sign-in, Docker group management with a one-click relaunch to apply the group, engine info |
+
+## Screenshots
+
+| Overview | Containers |
+|---|---|
+| ![DockDesk overview dashboard](public/docs/screenshots/overview.png) | ![DockDesk containers page](public/docs/screenshots/containers.png) |
+
+| Images | Volumes |
+|---|---|
+| ![DockDesk images page](public/docs/screenshots/images.png) | ![DockDesk volumes page](public/docs/screenshots/volumes.png) |
+
+| Compose | Activity |
+|---|---|
+| ![DockDesk Compose projects](public/docs/screenshots/compose.png) | ![DockDesk activity feed](public/docs/screenshots/activity.png) |
+
+
+## Help wanted
+
+Contributions are especially welcome in these areas:
+
+1. **Native speaker review** of the Spanish, French, German, and Hindi translations
+2. **Packaging** for Fedora, Arch, openSUSE, and other Linux distributions
+3. **Testing** on more Linux distributions and desktop environments
+4. **Accessibility improvements** for the embedded terminal
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) to get started.
 
 ## Requirements
 
@@ -130,4 +177,4 @@ simultaneous connections per host and the page needs a few for itself. The embed
 
 ## License
 
-MIT, copyright (c) 2026 Panem Yaswanth Reddy. See `LICENSE`. The bundled terminal library (xterm.js) is MIT licensed too; see `THIRD_PARTY_NOTICES.md`. Security issues: see `SECURITY.md`.
+MIT, copyright (c) 2026 Panem Yaswanth Reddy. See [LICENSE](LICENSE). The bundled terminal library (xterm.js) is MIT licensed too; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). See [CONTRIBUTING.md](CONTRIBUTING.md) to contribute, and [SECURITY.md](SECURITY.md) to report security issues.
